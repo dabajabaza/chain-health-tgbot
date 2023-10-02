@@ -1,0 +1,10 @@
+[paths]
+log_path = "logs/"
+data_path = "data/"
+
+[database]
+provider = "sqlite"
+address = ""
+port = 0
+login = ""
+passw = ""

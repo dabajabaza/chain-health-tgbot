@@ -1,0 +1,24 @@
+[project]
+name = "chain_health_tgbot"
+description = "Bot monitors chain mileage"
+requires-python = ">=3.11.4"
+version = "0.1.0"
+authors = [
+    { name = "Carbon-Based Lifeform", email = "sdrv87@gmail.com" }
+]
+dependencies = [
+    "alembic==1.12.0",
+    "psycopg2-binary==2.9.7",
+    "python-telegram-bot==20.5",
+    "SQLAlchemy==2.0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "tox==4.11.3",
+    "pytest==7.4.2",
+]
+
+[build-system]
+requires = ["setuptools >= 65.5.0"]
+build-backend = "setuptools.build_meta"
