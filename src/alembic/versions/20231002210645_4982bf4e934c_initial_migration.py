@@ -1,8 +1,8 @@
-"""initial migration
+"""Initial migration
 
-Revision ID: ea30e9765e2b
+Revision ID: 4982bf4e934c
 Revises: 
-Create Date: 2023-09-22 21:31:14.749520
+Create Date: 2023-10-02 21:06:45.038887
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = 'ea30e9765e2b'
+revision: str = '4982bf4e934c'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -24,7 +24,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('username', sa.String(length=255), nullable=True),
     sa.Column('created_at', sa.DateTime(), nullable=False),
-    sa.PrimaryKeyConstraint('id')
+    sa.PrimaryKeyConstraint('id', name=op.f('pk_users'))
     )
     op.create_table('chains',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -35,15 +35,15 @@ def upgrade() -> None:
     sa.Column('expired_at', sa.DateTime(), nullable=True),
     sa.Column('mileage_total', sa.Integer(), nullable=False),
     sa.Column('user_id', sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], name='chains_FK01__user_id__users_id'),
-    sa.PrimaryKeyConstraint('id')
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_chains_user_id_users')),
+    sa.PrimaryKeyConstraint('id', name=op.f('pk_chains'))
     )
     op.create_table('groups',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('name', sa.String(length=255), nullable=True),
     sa.Column('user_id', sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], name='groups_FK01__user_id__users_id'),
-    sa.PrimaryKeyConstraint('id')
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_groups_user_id_users')),
+    sa.PrimaryKeyConstraint('id', name=op.f('pk_groups'))
     )
     op.create_table('groupschains',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -52,10 +52,10 @@ def upgrade() -> None:
     sa.Column('mileage_cycle_current', sa.Integer(), nullable=False),
     sa.Column('mileage_cycle_limit', sa.Integer(), nullable=False),
     sa.Column('is_active', sa.Boolean(), nullable=False),
-    sa.ForeignKeyConstraint(['chain_id'], ['chains.id'], name='groupschains_FK02__chain_id__chains_id'),
-    sa.ForeignKeyConstraint(['group_id'], ['groups.id'], name='groupschains_FK01__group_id__groups_id'),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('group_id', 'chain_id', name='groupschains_AK01__group_id__chain_id')
+    sa.ForeignKeyConstraint(['chain_id'], ['chains.id'], name=op.f('fk_groupschains_chain_id_chains')),
+    sa.ForeignKeyConstraint(['group_id'], ['groups.id'], name=op.f('fk_groupschains_group_id_groups')),
+    sa.PrimaryKeyConstraint('id', name=op.f('pk_groupschains')),
+    sa.UniqueConstraint('group_id', 'chain_id', name=op.f('uq_groupschains_group_id'))
     )
     # ### end Alembic commands ###
 
