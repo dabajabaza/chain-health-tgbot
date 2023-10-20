@@ -3,7 +3,7 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from alembic import context
 from config import get_db_connection_string
-from chain_health_tgbot.models import *
+from chain_health_tgbot.models import Base
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
