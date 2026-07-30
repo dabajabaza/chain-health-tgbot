@@ -38,6 +38,12 @@ class MileageService:
         source: str = RideSource.MANUAL,
         external_id: str | None = None,
     ) -> RecordedRide:
+        """Log a ride on the user's active chain and return the resulting status.
+
+        ``ride_dt`` defaults to today in the configured timezone. Raises
+        NoActiveChainError when the user has no current group or that group
+        has no active chain.
+        """
         group = await self._garage.current_group(user_id)
         chain = await self._garage.active_chain(group) if group is not None else None
         if group is None or chain is None:

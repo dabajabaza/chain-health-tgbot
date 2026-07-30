@@ -6,6 +6,8 @@ from chain_health.db.models import Chain, Group, Ride
 
 @dataclass(frozen=True, slots=True)
 class ChainStatus:
+    """One chain's mileage snapshot: current-cycle and lifetime totals."""
+
     chain: Chain
     cycle_km: float
     total_km: float
@@ -21,15 +23,23 @@ class ChainStatus:
 
     @property
     def over_limit(self) -> bool:
+        """Whether the current cycle has reached the chain's rotation limit."""
         return self.cycle_km >= self.cycle_limit_km
 
     @property
     def resource_warning(self) -> bool:
+        """Whether lifetime mileage has reached the chain's total resource, if one is set."""
         return self.chain.resource_km is not None and self.total_km >= self.chain.resource_km
 
 
 @dataclass(frozen=True, slots=True)
 class StatusView:
+    """Everything the status screen shows for one user's current group.
+
+    ``group`` and ``active`` are None when the user has no current group or
+    it has no active chain, respectively.
+    """
+
     group: Group | None
     active: ChainStatus | None
     all_chains: list[ChainStatus]
@@ -37,6 +47,12 @@ class StatusView:
 
 @dataclass(frozen=True, slots=True)
 class RotationOptions:
+    """Chains eligible for rotation, keyed by lifetime mileage (``totals`` maps chain id to km).
+
+    ``recommended`` is the least-worn candidate, or None when there are no
+    candidates at all.
+    """
+
     candidates: list[Chain]
     totals: dict[int, float]
     recommended: Chain | None
@@ -57,6 +73,8 @@ class CycleBoundary:
 
 @dataclass(frozen=True, slots=True)
 class RecordedRide:
+    """Result of logging a ride: the ride itself plus the chain's status right after it."""
+
     group: Group
     ride: Ride
     status: ChainStatus
@@ -64,12 +82,16 @@ class RecordedRide:
 
 @dataclass(frozen=True, slots=True)
 class DueReminder:
+    """A reminder that should be sent: the user and the chain status that triggered it."""
+
     user_id: int
     status: ChainStatus
 
 
 @dataclass(frozen=True, slots=True)
 class ExternalRide:
+    """A ride as reported by a MileageSource, before it is persisted as a Ride."""
+
     external_id: str
     ride_dt: date
     distance_km: float

@@ -10,6 +10,12 @@ from chain_health.services.status import StatusService
 
 
 class ReminderService:
+    """Decides who is due a daily over-limit/wear reminder and records that it was sent.
+
+    Timing lives in scheduler.py; message wording and transport live behind
+    the ``ReminderNotifier`` port.
+    """
+
     def __init__(
         self, session: AsyncSession, status_service: StatusService, notifier: ReminderNotifier
     ) -> None:
@@ -18,7 +24,9 @@ class ReminderService:
         self._notifier = notifier
 
     async def due_user_ids(self, today_dt: date) -> list[int]:
-        """Builds the full DueReminder list (see D6 on the per-chain query
+        """Return the ids of every user due a reminder today.
+
+        Builds the full DueReminder list (see D6 on the per-chain query
         cost) just to project out the id. scheduler.py's phase 2 then
         recomputes the same status per user anyway, in its own fresh scope —
         deliberately, so a stale phase-1 status can't be notified against
@@ -31,6 +39,11 @@ class ReminderService:
     async def due_reminders(
         self, today_dt: date, *, user_id: int | None = None
     ) -> list[DueReminder]:
+        """Return the reminders due today: active chain over limit or past its resource.
+
+        Users already reminded today are skipped; ``user_id`` narrows the
+        check to one user (the phase-2 re-check in scheduler.py).
+        """
         stmt = select(User).where(User.current_group_id.is_not(None))
         if user_id is not None:
             stmt = stmt.where(User.id == user_id)
@@ -65,6 +78,7 @@ class ReminderService:
         return True
 
     async def mark_reminded(self, user_id: int, today_dt: date) -> None:
+        """Record that the user was reminded today, suppressing repeats until tomorrow."""
         user = await self._session.get(User, user_id)
         if user is not None:
             user.last_reminder_sent_dt = today_dt

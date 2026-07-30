@@ -29,6 +29,12 @@ def _cycle_predicate(boundary: CycleBoundary) -> ColumnElement[bool]:
 
 
 class RideService:
+    """CRUD and mileage aggregation for individual rides.
+
+    Knows nothing about which chain is active — MileageService resolves that
+    and hands a concrete ``Chain`` in.
+    """
+
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
@@ -42,6 +48,7 @@ class RideService:
         source: str = RideSource.MANUAL,
         external_id: str | None = None,
     ) -> Ride:
+        """Persist a ride against the given chain and return it."""
         ride = Ride(
             user_id=user_id,
             chain_id=chain.id,
@@ -55,7 +62,7 @@ class RideService:
         return ride
 
     async def require_ride(self, user_id: int, ride_id: int) -> Ride:
-        """Raises NotFoundError if the ride does not exist or is not this user's."""
+        """Return the ride, raising NotFoundError if it does not exist or is not this user's."""
         stmt = select(Ride).where(Ride.id == ride_id, Ride.user_id == user_id)
         ride = await self._session.scalar(stmt)
         if ride is None:
@@ -63,15 +70,18 @@ class RideService:
         return ride
 
     async def edit_ride(self, ride: Ride, distance_km: float) -> Ride:
+        """Change the ride's distance and return it."""
         ride.distance_km = distance_km
         await self._session.flush()
         return ride
 
     async def delete_ride(self, ride: Ride) -> None:
+        """Delete the ride, removing its mileage from every total."""
         await self._session.delete(ride)
         await self._session.flush()
 
     async def recent_rides(self, user_id: int, limit: int = 10) -> Sequence[Ride]:
+        """Return the user's most recently recorded rides, newest first, chains preloaded."""
         stmt = (
             select(Ride)
             .where(Ride.user_id == user_id)
@@ -82,12 +92,14 @@ class RideService:
         return (await self._session.scalars(stmt)).all()
 
     async def total_km(self, chain: Chain) -> float:
+        """Return the chain's lifetime mileage across all cycles."""
         stmt = select(func.coalesce(func.sum(Ride.distance_km), 0.0)).where(
             Ride.chain_id == chain.id
         )
         return await self._session.scalar(stmt) or 0.0
 
     async def cycle_km(self, chain: Chain) -> float:
+        """Return mileage since the chain's last activation (all-time if never rotated)."""
         boundary = await self._last_activation(chain.id)
         stmt = select(func.coalesce(func.sum(Ride.distance_km), 0.0)).where(
             Ride.chain_id == chain.id

@@ -96,6 +96,7 @@ class Responder:
     async def reply(
         self, chat_id: int, user_id: int, text: str, *, data_changed: bool = False
     ) -> None:
+        """Send a message with a fresh reply-keyboard placeholder; sync the pin if data changed."""
         view = await self._status_service.build(user_id)
         keyboard = keyboards.main_reply_keyboard(texts.placeholder_text(view))
         await self._bot.send_message(chat_id, text, reply_markup=keyboard)
@@ -111,6 +112,7 @@ class Responder:
         *,
         data_changed: bool = False,
     ) -> None:
+        """Send a message with inline buttons; sync the pinned status if data changed."""
         # Telegram allows only one keyboard type per message, so the reply-keyboard
         # placeholder is not refreshed here — it catches up on the next plain reply().
         await self._bot.send_message(chat_id, text, reply_markup=reply_markup)

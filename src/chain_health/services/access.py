@@ -12,20 +12,31 @@ from chain_health.timeutils import utcnow
 
 
 class AccessService:
+    """Identity and admission: who is allowed in, and how invites are issued and redeemed.
+
+    Admins come from config (``Settings.admin_ids``); everyone else must hold
+    a ``users`` row, created either by an admin's ``/allow`` or by redeeming a
+    one-time invite.
+    """
+
     def __init__(self, session: AsyncSession, settings: Settings) -> None:
         self._session = session
         self._settings = settings
 
     def is_admin(self, user_id: int) -> bool:
+        """Return whether the user id is in the configured ADMIN_IDS set."""
         return user_id in self._settings.admin_ids
 
     async def is_allowed(self, user_id: int) -> bool:
+        """Return whether the user may use the bot: an admin or an allowlisted user."""
         if self.is_admin(user_id):
             return True
         return await self._session.get(User, user_id) is not None
 
     async def ensure_registered(self, user_id: int, username: str | None) -> User:
-        """Idempotent, and safe against a concurrent update racing on the same
+        """Return the user's row, creating it (or refreshing the username) as needed.
+
+        Idempotent, and safe against a concurrent update racing on the same
         user_id: aiogram runs updates as concurrent tasks (see D21), so
         two updates from a brand-new user's very first contact can both reach
         the ``user is None`` branch before either commits. A nested
@@ -48,7 +59,9 @@ class AccessService:
         return user
 
     async def allow_user(self, user_id: int, username: str | None = None) -> User:
-        """The `/allow` admin command's entry point: same effect as
+        """Admit a user to the allowlist by explicit admin action.
+
+        The `/allow` admin command's entry point: same effect as
         ensure_registered, but this name is the one that should show up in an
         audit trail of "who did an admin explicitly let in" rather than
         "who got auto-registered as a side effect of some other action".
@@ -56,6 +69,7 @@ class AccessService:
         return await self.ensure_registered(user_id, username)
 
     async def create_invite(self, created_by: int) -> Invite:
+        """Issue a one-time invite code that expires after INVITE_TTL_HOURS."""
         await self.ensure_registered(created_by, None)
         invite = Invite(
             code=secrets.token_urlsafe(INVITE_CODE_BYTES),
@@ -67,7 +81,9 @@ class AccessService:
         return invite
 
     async def redeem_invite(self, code: str, user_id: int, username: str | None) -> bool:
-        """Atomic claim: a plain read-then-write here would let two
+        """Claim the invite for this user; return False if unknown, spent, or expired.
+
+        Atomic claim: a plain read-then-write here would let two
         concurrent ``/start <code>`` updates both observe ``used_by IS NULL``
         before either commits, and both redeem the same one-time invite. The
         UPDATE's WHERE clause is re-checked at write time, so only the first
