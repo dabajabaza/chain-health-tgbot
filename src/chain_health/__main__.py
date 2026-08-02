@@ -16,8 +16,15 @@ from chain_health.bot.middlewares import AuthMiddleware, PrivateChatOnlyMiddlewa
 from chain_health.config import Settings
 from chain_health.di import build_container
 from chain_health.scheduler import run_reminder_scheduler
+from chain_health.watchdog import run_watchdog, sd_notify
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Liveness ping cadence. The supervisor's own timeout has to be comfortably
+# larger than this interval, or a single slow probe would look like a hang;
+# the server pairs these 30s with a 90s timeout.
+_WATCHDOG_INTERVAL = 30
+_WATCHDOG_PROBE_TIMEOUT = 10
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
 logger = logging.getLogger("chain_health")
@@ -71,13 +78,21 @@ async def _run_bot(settings: Settings) -> None:
 
     await _set_commands(bot)
 
+    # Reaching this point means the bot talked to Telegram successfully, so it
+    # is the honest moment to report readiness.
+    sd_notify("READY=1")
+
     scheduler_task = asyncio.create_task(run_reminder_scheduler(container, settings))
+    watchdog_task = asyncio.create_task(
+        run_watchdog(bot, interval=_WATCHDOG_INTERVAL, probe_timeout=_WATCHDOG_PROBE_TIMEOUT)
+    )
     try:
         await dp.start_polling(bot)
     finally:
-        scheduler_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await scheduler_task
+        for task in (scheduler_task, watchdog_task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await container.close()
 
 
