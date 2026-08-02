@@ -2,6 +2,7 @@ from collections.abc import AsyncIterable
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from dishka import AsyncContainer, Provider, Scope, make_async_container, provide
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -34,7 +35,10 @@ class AppProvider(Provider):
     @provide
     async def bot(self, settings: Settings) -> AsyncIterable[Bot]:
         default = DefaultBotProperties(parse_mode=ParseMode.HTML)
-        bot = Bot(token=settings.bot_token, default=default)
+        # Without TELEGRAM_PROXY aiogram builds its own session and connects
+        # directly, which is what we want wherever Telegram is reachable.
+        session = AiohttpSession(proxy=settings.telegram_proxy) if settings.telegram_proxy else None
+        bot = Bot(token=settings.bot_token, default=default, session=session)
         yield bot
         await bot.session.close()
 

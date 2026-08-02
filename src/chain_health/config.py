@@ -35,6 +35,14 @@ class Settings(BaseSettings):
         default="UTC",
         description="IANA timezone name for 'local' dates and the reminder schedule",
     )
+    telegram_proxy: str | None = Field(
+        default=None,
+        alias="TELEGRAM_PROXY",
+        description=(
+            "Proxy URL for reaching api.telegram.org, e.g. http://127.0.0.1:1080. "
+            "Required where the ISP blocks Telegram; leave unset for a direct connection"
+        ),
+    )
 
     @property
     def admin_ids(self) -> set[int]:
