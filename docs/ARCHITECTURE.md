@@ -13,7 +13,9 @@ Each entry: **Context** (why this came up) → **Decision** → **Consequences**
 ## D1 — SQLite only
 
 **Context:** Single-user-ish personal bot on a home server; no multi-writer
-concurrency, no need for a DB server process.
+*processes*, no need for a DB server process. Inside the one process there is
+still concurrency — aiogram runs every update as its own task — which is what
+D21 is about; "single writer" here means one process, not one task.
 
 **Decision:** SQLite is the only supported backend. This is load-bearing in a
 few places, not incidental:
@@ -31,6 +33,10 @@ few places, not incidental:
   (`isolation_level = None` plus an explicit `BEGIN IMMEDIATE`) — a
   driver-specific workaround, without which SAVEPOINTs are not real nested
   transactions at all. See D21.
+- One writer per database means updates are serialized by a process-wide lock
+  (D21), and that in turn is why sending had to move out of the transaction
+  (D10): on a server-based database a held write lock costs one connection,
+  here it costs the whole bot's throughput.
 - The partial unique index also means `GarageService.add_chain`/`rotate` must
   deactivate the previously-active chain in its **own** `flush()`, before
   activating the new one. SQLAlchemy batches same-table UPDATEs by primary
@@ -235,33 +241,67 @@ configured timezone) injected into `GarageService`.
 **Revisit when:** never, unless multi-timezone users are supported (right
 now there's one `TZ` in `.env` for the whole bot).
 
-## D10 — Side effects before commit
+## D10 — Replies are recorded, then sent after the commit
 
-**Context:** Telegram sends happen inside the request's dishka scope,
-*before* the session commits (there's no two-phase commit between "send a
-message" and "write a row").
+**Context:** This decision was reversed once, and the reversal is the point.
 
-**Decision:** Deliberately asymmetric:
-- The **primary reply** and the transaction live and die together — if
-  `send_message` fails, letting the transaction roll back is *correct*:
-  nothing was recorded, the user's retry doesn't create a duplicate.
-- The **pinned status message** is best-effort. `Responder._sync_pinned`
-  catches `TelegramAPIError` around the `pin_chat_message` call specifically
-  and logs a warning rather than raising — a pin failure must never discard
-  an already-recorded ride. It also stores the pinned message id **before**
-  attempting to pin, so a pin failure doesn't orphan the message (the next
-  sync would otherwise create a duplicate one, forever).
+Originally Telegram sends happened inside the request's dishka scope, *before*
+the session committed — there is no two-phase commit between "send a message"
+and "write a row", so the ordering had to favour one failure mode over the
+other, and a send failure rolling the transaction back looked like the safer
+choice: nothing recorded, the user's retry creates no duplicate.
 
-**Consequences:** Nothing structural was added to fix this fully (it can't be
-fixed fully without 2PC with Telegram, which doesn't exist). The residual
-hazard: a *commit* failure (not a send failure) surfaces as
-`dishka.exceptions.ExitError` raised from the request scope's `__aexit__`,
-**after** the handler already returned and the reply was already sent — on a
-local SQLite file this means disk-full or corruption, not a normal failure
-mode.
+What that ordering cost only became visible under measurement. While the send
+sits inside the transaction, SQLite's single write lock stays held for the
+entire round trip to Telegram. Measured with 20 concurrent rides at 50 ms per
+call: 3.67 s for the batch, 5.4 updates/s — and never more than **one** call in
+flight at a time. The bot was exactly as fast as the network, serialized, and no
+amount of traffic could make it faster.
 
-**Revisit when:** moving off SQLite to something where commit failures are a
-realistic operational event.
+**Decision:** Handlers record intent into `Responder` (`bot/ui.py`) instead of
+calling the Bot API. `WriteLockMiddleware` delivers the queue once the dishka
+scope has closed — transaction committed, write lock released.
+
+The gap this opens (an applied change nobody was told about) is closed by a
+queue, not by ordering. The promise to reply is written into the `outbox` table
+in the same transaction as the change; delivery right after the commit deletes
+the row; a failure leaves it for the background sender (`outbox.py`), which
+retries with backoff up to a TTL. At-least-once: a duplicated *reply* is
+harmless, a lost one is not, because the user re-enters the ride and it gets
+logged twice.
+
+Not everything is queued. Telegram accepts an answer to a callback query for
+seconds only; clearing a spent keyboard is cosmetic; and the **pinned status
+message** stays best-effort as before — `Responder._sync_pinned` swallows
+`TelegramAPIError` and logs, and stores the recreated message's id *before*
+attempting to pin so a pin failure cannot orphan it. It rebuilds itself on the
+next update anyway.
+
+One failure is deliberately not swallowed: `StaleMessageError`. Retrying cannot
+resurrect a message Telegram says is gone, and `dp.errors` still has work to do
+— `cb_group_add` sets an FSM state before its prompt can fail, and a dangling
+state would eat the user's next message. It is raised after the rest of the
+queue has gone out, so the callback answer still stops the spinner.
+
+**Consequences:** the same measurement afterwards — 0.44 s, 45 updates/s, up to
+13 calls in flight. The limit moved from the network to the commits. This is
+pinned as a property rather than a stopwatch:
+`tests/test_concurrency.py::test_the_database_is_free_while_talking_to_telegram`
+asks the database itself whether it is writable during every Telegram call.
+
+The price is a second, very short transaction after delivery, for the two facts
+that only exist afterwards: which outbox rows went out, and the id of a
+recreated pinned message. Losing it is harmless both ways — an undeleted row
+means one duplicate reply, a lost pinned id means one extra pinned message.
+
+The residual hazard from the old ordering is gone in one direction and unchanged
+in the other: a *commit* failure still surfaces from the request scope's
+`__aexit__`, but now nothing has been sent yet when it does. On a local SQLite
+file that means disk-full or corruption, not a normal failure mode.
+
+**Revisit when:** a handler needs a Telegram call's *result* mid-flight (none
+does today), or the outbox stops draining — a queue that grows means systematic
+delivery failure, not the occasional blip it is sized for.
 
 ## D11 — dishka finalizes generators with `asend`, not `athrow`
 
@@ -553,8 +593,20 @@ from the same user (e.g. a double-tapped button, or their very first message
 arriving as two near-simultaneous updates) can interleave inside one process
 exactly like two separate writers would.
 
-**Decision:** Two different tools for two different race shapes, both in
-`AccessService`:
+**Decision:** Writes are serialized process-wide by a single `asyncio.Lock`
+(`WriteLockMiddleware`), and two further tools handle the race shapes that a
+lock alone does not settle, both in `AccessService`:
+
+The lock is registered *outside* dishka's `ContainerMiddleware`, which is
+load-bearing: the unit of work commits when the scope closes (D11), so a lock
+registered inside would be released before the commit it is meant to cover.
+Sitting outside also means it is already released when the replies go out
+(D10) — the network is not on the write path. Without it, concurrency was
+arbitrated by `busy_timeout` alone, which turns a queue into a deadline: it
+papers over the contention right up until traffic outgrows the timeout, then
+starts dropping updates with "database is locked".
+`tests/test_concurrency.py::test_concurrent_updates_do_not_rely_on_busy_timeout`
+disables the busy handler entirely, which is what makes it discriminate.
 - `ensure_registered`'s insert-or-get race (two concurrent first-contacts
   both seeing `user is None`) is handled with a `begin_nested()` SAVEPOINT
   around the insert: a `UNIQUE`-constraint loss rolls back only the insert,
