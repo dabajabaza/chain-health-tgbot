@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -71,6 +72,43 @@ class PrivateChatOnlyMiddleware(BaseMiddleware):
                 )
             return None
         return await handler(event, data)
+
+
+class WriteLockMiddleware(BaseMiddleware):
+    """Serializes request scopes, because SQLite allows exactly one writer.
+
+    Registered on ``dp.update.outer_middleware`` *before* ``setup_dishka``, and
+    that ordering is the whole point: the unit of work commits when the dishka
+    scope closes (see di.py ``RequestProvider.session``), which happens inside
+    ``ContainerMiddleware``. A lock registered after it would be released before
+    the commit it is supposed to cover, and the next update would read state the
+    previous one had not yet written.
+
+    Without it, concurrency is arbitrated by ``busy_timeout`` (db/engine.py):
+    the second writer blocks inside SQLite's busy handler and dies with
+    "database is locked" once the wait runs out. That turns a queue into a
+    deadline — and the wait is long, because a handler holds its transaction
+    across Telegram round-trips. Here the second writer waits on an asyncio lock
+    instead: no timeout, no busy-handler spinning, and the event loop stays free
+    to do the network I/O of updates that are already past their commit.
+
+    ``BEGIN IMMEDIATE`` stays as-is. This lock covers writers inside the
+    process, which D1's single-process bot makes sufficient in practice, but an
+    alembic migration on startup or a hand-run script over the live database is
+    still an outside writer.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        async with self._lock:
+            return await handler(event, data)
 
 
 # Telegram keeps unconfirmed updates for a day, so a week of marks is ample and
