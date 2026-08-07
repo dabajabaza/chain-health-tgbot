@@ -6,16 +6,12 @@ import pytest
 import pytest_asyncio
 from aiogram import Bot
 from dishka import AsyncContainer
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from chain_health.__main__ import build_dispatcher
 from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
 from chain_health.config import Settings
+from chain_health.db.engine import create_engine
 from chain_health.di import build_container
 from tests.bot_harness import BotHarness, RecordingSession
 from tests.factories import FAKE_BOT_TOKEN
@@ -76,7 +72,12 @@ def settings(db_path: Path) -> Settings:
 
 @pytest_asyncio.fixture
 async def engine(db_path: Path) -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    """Built with the production `db.engine.create_engine`, not a bare
+    `create_async_engine` — the pragmas and, more importantly, the pysqlite
+    transaction handling it configures are part of the semantics under test
+    (a plain engine gets fake SAVEPOINTs; see test_engine.py).
+    """
+    eng = create_engine(f"sqlite+aiosqlite:///{db_path}")
     yield eng
     await eng.dispose()
 

@@ -27,6 +27,10 @@ few places, not incidental:
 - `migrations/env.py` always configures `render_as_batch=True` — SQLite
   can't do most `ALTER TABLE` operations directly; Alembic's batch mode
   recreates the table under the hood for every column add/rename/drop.
+- `db/engine.py` has to take transaction control away from the sqlite3 driver
+  (`isolation_level = None` plus an explicit `BEGIN IMMEDIATE`) — a
+  driver-specific workaround, without which SAVEPOINTs are not real nested
+  transactions at all. See D21.
 - The partial unique index also means `GarageService.add_chain`/`rotate` must
   deactivate the previously-active chain in its **own** `flush()`, before
   activating the new one. SQLAlchemy batches same-table UPDATEs by primary
@@ -559,6 +563,47 @@ exactly like two separate writers would.
   same code) is handled with a single atomic `UPDATE ... WHERE used_by IS
   NULL`, re-checked at write time — SQLite serializes writers, so only one
   `UPDATE` can match the row and get `rowcount == 1`.
+
+**Prerequisite — the driver must not own transactions:** `begin_nested()`
+only means anything inside a real enclosing transaction, and pysqlite does not
+open one by default. Under its "legacy transaction control" (still the
+`sqlite3` default, and inherited by aiosqlite) the driver emits `BEGIN`
+implicitly before DML only, leaving SELECT, DDL **and SAVEPOINT** in
+autocommit. A `SAVEPOINT` issued that way opens a transaction of its own, so
+the matching `RELEASE` durably commits it and the enclosing
+`session.rollback()` finds nothing to undo: the SAVEPOINT above silently
+degrades to a plain insert, with no error and no warning. `db/engine.py`
+therefore applies SQLAlchemy's documented pysqlite recipe — `isolation_level =
+None` on the `connect` event to stop the driver emitting BEGIN, plus a `begin`
+event that emits it instead. Pinned by
+`tests/test_engine.py::test_savepoint_is_undone_by_a_rollback_of_the_enclosing_transaction`,
+which fails (the row survives the rollback) against the un-configured engine.
+
+Owning transactions has two consequences, both of which turned pre-existing
+latent bugs into loud ones:
+- **The BEGIN is `IMMEDIATE`.** A deferred transaction pins its read snapshot
+  at the first SELECT and only asks for the write lock later; SQLite answers
+  that upgrade with `SQLITE_BUSY` *immediately*, without consulting
+  `busy_timeout`, because no amount of waiting can restore a snapshot another
+  writer has already invalidated. Every read-then-write handler racing a
+  second update hit exactly that. Taking the write lock up front turns the
+  race back into a wait the busy handler can serve; the cost is that request
+  scopes serialize, which D1's single-writer bot can afford.
+- **One update opens exactly one dishka REQUEST scope.** `setup_dishka`
+  registers its scope-opening middleware on *every* aiogram observer, and
+  aiogram nests observers — so a message used to enter one scope on `update`
+  (where `IdempotencyMiddleware` runs) and a second, sibling scope on
+  `message` (auth and the handler): two sessions on two connections, two
+  transactions for one update. The `processed_updates` mark was committed
+  separately from the change it is meant to be atomic with — the very
+  redelivery window the middleware exists to close — and with real
+  transactions the outer scope's open transaction just deadlocks the inner
+  scope's writes. `__main__._collapse_dishka_scopes` unregisters that
+  middleware everywhere except `update` and `error`; the `error` observer
+  keeps its own scope because aiogram propagates an error only after the
+  update chain has unwound, so the scope that raised is already closed (see
+  `bot/errors.py`). Pinned by
+  `tests/test_di.py::test_one_update_runs_in_exactly_one_request_scope`.
 
 **Consequences:** A plain read-then-write (`get`, check, then `add`/`update`)
 is not safe for either case, even on SQLite, even single-process — the

@@ -1,4 +1,8 @@
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 import pytest
+from aiogram.types import TelegramObject
 from dishka import AsyncContainer
 from dishka.exceptions import ExitError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +16,7 @@ from chain_health.services.reminders import ReminderService
 from chain_health.services.rides import RideService
 from chain_health.services.status import StatusService
 from chain_health.services.users import UserService
+from tests.bot_harness import BotHarness
 
 REQUEST_SCOPED_SERVICES = [
     AsyncSession,
@@ -98,3 +103,35 @@ async def test_two_request_scopes_get_independent_sessions(container: AsyncConta
         session1 = await rc1.get(AsyncSession)
         session2 = await rc2.get(AsyncSession)
         assert session1 is not session2
+
+
+async def test_one_update_runs_in_exactly_one_request_scope(harness: BotHarness):
+    """One update = one unit of work, all the way through the middleware stack.
+
+    ``setup_dishka`` opens a REQUEST scope on *every* aiogram observer, and
+    aiogram nests observers, so before ``__main__._collapse_dishka_scopes`` a
+    message entered one scope on ``update`` (where IdempotencyMiddleware runs)
+    and a second, sibling scope on ``message`` (where auth and the handler
+    run). Two scopes are two sessions on two connections: the
+    ``processed_updates`` mark committed in a different transaction than the
+    change it is supposed to be atomic with, and — once the engine opens real
+    SQLite transactions — the outer scope's open transaction deadlocks the
+    inner scope's writes.
+    """
+    seen: list[AsyncSession] = []
+
+    async def capture(
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        seen.append(await data["dishka_container"].get(AsyncSession))
+        return await handler(event, data)
+
+    harness.dp.update.middleware(capture)
+    harness.dp.message.outer_middleware(capture)
+
+    await harness.send("/status", user_id=1)
+
+    assert len(seen) == 2, "both the update-level and the message-level chain must run"
+    assert seen[0] is seen[1]
