@@ -12,7 +12,11 @@ from dishka.integrations.aiogram import setup_dishka
 
 from chain_health.bot.errors import on_error
 from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
-from chain_health.bot.middlewares import AuthMiddleware, PrivateChatOnlyMiddleware
+from chain_health.bot.middlewares import (
+    AuthMiddleware,
+    IdempotencyMiddleware,
+    PrivateChatOnlyMiddleware,
+)
 from chain_health.config import Settings
 from chain_health.di import build_container
 from chain_health.scheduler import run_reminder_scheduler
@@ -55,6 +59,9 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     dp.errors.register(on_error)
 
     setup_dishka(container, dp, auto_inject=True)
+    # After dishka (needs the request-scoped session) and before auth: a
+    # redelivered update must not reach ensure_registered either.
+    dp.update.middleware(IdempotencyMiddleware())
     auth = AuthMiddleware()
     dp.message.outer_middleware(auth)
     dp.callback_query.outer_middleware(auth)

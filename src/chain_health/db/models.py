@@ -242,3 +242,28 @@ class Ride(Base):
     )
 
     chain: Mapped[Chain] = relationship(back_populates="rides", doc="Chain the ride counts toward")
+
+
+class ProcessedUpdate(Base):
+    """Marks a Telegram update as applied, so a redelivery cannot repeat it.
+
+    Telegram treats an update as delivered only once the offset is confirmed,
+    and that confirmation rides on the *next* getUpdates call. A process killed
+    in between — which is exactly what a deploy does — receives the same
+    update_id again, and the ride would be logged twice. A duplicate is worse
+    than a loss here: a dropped message the user simply resends, whereas a
+    double entry silently corrupts mileage.
+
+    The row is written inside the same transaction as the business change (one
+    request scope is one transaction, see RequestProvider), so no state exists
+    where the change landed but the mark did not.
+    """
+
+    __tablename__ = "processed_updates"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True, autoincrement=False, comment="Telegram update id"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, default=utcnow, comment="UTC instant the update was applied"
+    )

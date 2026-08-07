@@ -1,13 +1,18 @@
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.enums import ChatType
 from aiogram.types import Message, TelegramObject
 from dishka import AsyncContainer
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from chain_health.db.models import ProcessedUpdate
 from chain_health.services.access import AccessService
+from chain_health.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,68 @@ class PrivateChatOnlyMiddleware(BaseMiddleware):
                 )
             return None
         return await handler(event, data)
+
+
+# Telegram keeps unconfirmed updates for a day, so a week of marks is ample and
+# keeps the table from growing without bound.
+_MARK_TTL = timedelta(days=7)
+_PRUNE_EVERY = timedelta(hours=1)
+
+
+class IdempotencyMiddleware(BaseMiddleware):
+    """Drops an update that has already been applied.
+
+    Telegram confirms delivery only on the *next* getUpdates call, so a process
+    killed right after committing gets the same update_id again. Deploys kill
+    the bot on purpose, which means we aim at that window regularly.
+
+    Registered on ``dp.update`` *after* ``setup_dishka`` so the request-scoped
+    session already exists, and *before* the auth middleware so a redelivery
+    never reaches ``ensure_registered`` either.
+    """
+
+    def __init__(self) -> None:
+        self._pruned_at = utcnow() - _PRUNE_EVERY
+
+    async def _prune(self, session: AsyncSession) -> None:
+        now = utcnow()
+        if now - self._pruned_at < _PRUNE_EVERY:
+            return
+        self._pruned_at = now
+        await session.execute(
+            delete(ProcessedUpdate).where(ProcessedUpdate.created_at < now - _MARK_TTL)
+        )
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        update_id = getattr(event, "update_id", None)
+        if update_id is None:
+            return await handler(event, data)
+
+        container: AsyncContainer = data["dishka_container"]
+        session = await container.get(AsyncSession)
+
+        if await session.scalar(select(ProcessedUpdate.id).where(ProcessedUpdate.id == update_id)):
+            logger.warning("Update %s already applied — redelivery dropped", update_id)
+            return None
+
+        # Added, never committed here. Committing separately would mark the
+        # update as done *before* the change happened, and a crash in between
+        # would turn the duplicate risk into a loss. RequestProvider commits it
+        # together with the business change, or rolls both back on error.
+        session.add(ProcessedUpdate(id=update_id))
+        result = await handler(event, data)
+        # Pruned only after the handler, never before it. A DELETE issued up
+        # front takes SQLite's write lock for the whole request scope, and any
+        # other session that needs to write during handling then dies with
+        # "database is locked". Here the write lands right before the scope
+        # commits, so the lock is held about as briefly as it always was.
+        await self._prune(session)
+        return result
 
 
 class AuthMiddleware(BaseMiddleware):
