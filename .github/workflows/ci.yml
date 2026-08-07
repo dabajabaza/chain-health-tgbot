@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# Один активный прогон на ссылку: новый пуш отменяет предыдущий.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+
+jobs:
+  # Имя job'а — это имя статус-чека, на которое ссылается ruleset ветки main
+  # и которое проверяет сервер перед выкаткой тега. Менять его нельзя, не
+  # поправив ruleset: защита молча перестанет требовать зелёный CI.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # gitleaks смотрит всю историю, а не только последний коммит
+          fetch-depth: 0
+
+      - name: Поиск секретов
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/gitleaks" gitleaks
+          "$RUNNER_TEMP/gitleaks/gitleaks" detect \
+            --source . --log-opts=--all --no-banner --redact
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Зависимости строго по локу
+        run: uv sync --locked
+
+      # На сервере uv нет: там зависимости ставятся pip'ом из requirements.txt,
+      # который порождается из uv.lock. Если файл забыть перегенерировать, деплой
+      # поставит не то, что проверял CI, — и разойдётся молча. Регенерируем той же
+      # командой и требуем отсутствия диффа (команда попадает в шапку файла,
+      # поэтому экспорт во временный путь дал бы ложное расхождение).
+      - name: requirements.txt не разошёлся с uv.lock
+        run: |
+          uv export --format requirements-txt --no-hashes --no-dev -o requirements.txt
+          git diff --exit-code -- requirements.txt
+
+      - name: Тесты
+        run: uv run pytest -q
