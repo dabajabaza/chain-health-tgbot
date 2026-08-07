@@ -26,4 +26,15 @@ class ReminderNotifier(Protocol):
     adapter, not the caller.
     """
 
-    async def send_reminder(self, user_id: int, status: ChainStatus) -> None: ...
+    async def send_reminder(self, user_id: int, status: ChainStatus) -> None:
+        """Record that this user should be reminded. May not have sent anything yet."""
+        ...
+
+    async def deliver_pending(self) -> None:
+        """Actually send whatever send_reminder recorded.
+
+        Split out so the caller can commit its transaction first: the adapter
+        talks to a network, and holding SQLite's single write lock across that
+        round trip is what used to cap the whole bot's throughput.
+        """
+        ...

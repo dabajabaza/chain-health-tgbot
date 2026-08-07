@@ -10,7 +10,6 @@ from chain_health.bot.states import EditRideAmount
 from chain_health.bot.ui import (
     Responder,
     ask_number_or_retry,
-    edit_text_or_ignore,
     start_edit_dialog,
 )
 from chain_health.domain.constants import MAX_DISTANCE_KM
@@ -29,12 +28,15 @@ async def _rides_list_view(
 
 @router.callback_query(MenuCB.filter(F.action == MenuAction.RIDES))
 async def cb_menu_rides(
-    callback: CallbackQuery, state: FSMContext, rides_service: FromDishka[RideService]
+    callback: CallbackQuery,
+    state: FSMContext,
+    rides_service: FromDishka[RideService],
+    responder: FromDishka[Responder],
 ) -> None:
     await state.clear()
     text, keyboard = await _rides_list_view(rides_service, callback.from_user.id)
-    await edit_text_or_ignore(callback.message, text, keyboard)
-    await callback.answer()
+    responder.edit(callback.message, text, keyboard)
+    responder.answer_callback(callback)
 
 
 @router.callback_query(RideCB.filter(F.action == RideAction.DELETE))
@@ -50,9 +52,9 @@ async def cb_ride_delete(
     ride = await rides_service.require_ride(user_id, callback_data.ride_id)
     await rides_service.delete_ride(ride)
     text, keyboard = await _rides_list_view(rides_service, user_id)
-    await edit_text_or_ignore(callback.message, text, keyboard)
+    responder.edit(callback.message, text, keyboard)
     await responder.sync_pinned(callback_chat_id(callback), user_id)
-    await callback.answer(texts.ride_deleted_text())
+    responder.answer_callback(callback, texts.ride_deleted_text())
 
 
 @router.callback_query(RideCB.filter(F.action == RideAction.EDIT))
@@ -61,10 +63,16 @@ async def cb_ride_edit(
     callback_data: RideCB,
     state: FSMContext,
     rides_service: FromDishka[RideService],
+    responder: FromDishka[Responder],
 ) -> None:
     ride = await rides_service.require_ride(callback.from_user.id, callback_data.ride_id)
     await start_edit_dialog(
-        callback, state, EditRideAmount.value, texts.ASK_RIDE_AMOUNT, {"ride_id": ride.id}
+        callback,
+        state,
+        EditRideAmount.value,
+        texts.ASK_RIDE_AMOUNT,
+        {"ride_id": ride.id},
+        responder,
     )
 
 
@@ -75,7 +83,7 @@ async def fsm_ride_amount(
     rides_service: FromDishka[RideService],
     responder: FromDishka[Responder],
 ) -> None:
-    value = await ask_number_or_retry(message, max_value=MAX_DISTANCE_KM)
+    value = ask_number_or_retry(message, responder, max_value=MAX_DISTANCE_KM)
     if value is None:
         return
     user_id = message_user_id(message)
@@ -83,5 +91,5 @@ async def fsm_ride_amount(
     ride = await rides_service.require_ride(user_id, data["ride_id"])
     await rides_service.edit_ride(ride, value)
     await state.clear()
-    await message.answer(texts.ride_updated_text(value))
+    responder.reply_raw(message.chat.id, texts.ride_updated_text(value))
     await responder.sync_pinned(message.chat.id, user_id)

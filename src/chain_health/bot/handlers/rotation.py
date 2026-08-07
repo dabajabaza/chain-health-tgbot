@@ -1,14 +1,11 @@
-import contextlib
-
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InaccessibleMessage
+from aiogram.types import CallbackQuery
 from dishka import FromDishka
 
 from chain_health.bot import keyboards, texts
 from chain_health.bot.callbacks import RotateAction, RotateCB
-from chain_health.bot.ui import Responder, edit_text_or_ignore
+from chain_health.bot.ui import Responder
 from chain_health.domain.errors import NotFoundError
 from chain_health.services.garage import GarageService
 
@@ -21,20 +18,21 @@ async def cb_rotate_menu(
     callback_data: RotateCB,
     state: FSMContext,
     garage: FromDishka[GarageService],
+    responder: FromDishka[Responder],
 ) -> None:
     await state.clear()
     group = await garage.require_group(callback.from_user.id, callback_data.group_id)
     options = await garage.rotation_options(group)
     if not options.candidates:
-        await edit_text_or_ignore(callback.message, texts.NO_ROTATION_CANDIDATES)
-        await callback.answer()
+        responder.edit(callback.message, texts.NO_ROTATION_CANDIDATES)
+        responder.answer_callback(callback)
         return
 
     keyboard = keyboards.rotation_candidates_keyboard(
         group.id, options.candidates, options.recommended, options.totals
     )
-    await edit_text_or_ignore(callback.message, texts.ROTATION_PROMPT, keyboard)
-    await callback.answer()
+    responder.edit(callback.message, texts.ROTATION_PROMPT, keyboard)
+    responder.answer_callback(callback)
 
 
 @router.callback_query(RotateCB.filter(F.action == RotateAction.CONFIRM))
@@ -59,12 +57,10 @@ async def cb_rotate_confirm(
     await garage.rotate(chain)
 
     message = callback.message
-    if message is not None and not isinstance(message, InaccessibleMessage):
-        with contextlib.suppress(TelegramBadRequest):
-            await message.edit_reply_markup(reply_markup=None)
+    responder.clear_keyboard(message)
     chat_id = message.chat.id if message is not None else user_id
 
     await responder.reply(
         chat_id, user_id, texts.rotation_confirmed_text(chain.name), data_changed=True
     )
-    await callback.answer()
+    responder.answer_callback(callback)

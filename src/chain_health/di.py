@@ -43,8 +43,16 @@ class AppProvider(Provider):
         await bot.session.close()
 
     @provide
-    def engine(self, settings: Settings) -> AsyncEngine:
-        return create_engine(settings.database_url)
+    async def engine(self, settings: Settings) -> AsyncIterable[AsyncEngine]:
+        """Disposed when the container closes, so the pool's connections go with it.
+
+        A plain provider leaked them: the engine outlived every scope and its
+        pooled aiosqlite connections were only ever reclaimed by the garbage
+        collector, which complains about being handed an unclosed connection.
+        """
+        engine = create_engine(settings.database_url)
+        yield engine
+        await engine.dispose()
 
     @provide
     def session_factory(self, engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
