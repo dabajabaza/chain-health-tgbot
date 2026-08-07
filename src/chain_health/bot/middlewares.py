@@ -12,7 +12,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from chain_health.bot.ui import Responder
-from chain_health.db.models import ProcessedUpdate
+from chain_health.db.models import OutboxMessage, ProcessedUpdate
 from chain_health.services.access import AccessService
 from chain_health.services.users import UserService
 from chain_health.timeutils import utcnow
@@ -120,7 +120,9 @@ class WriteLockMiddleware(BaseMiddleware):
     """
 
     def __init__(self, container: AsyncContainer) -> None:
-        self._lock = asyncio.Lock()
+        # Public: the background outbox sender takes the same lock. SQLite has
+        # one writer per process, and that task is no exception.
+        self.lock = asyncio.Lock()
         # The app-level container, not a request scope: the follow-up
         # transaction below opens its own session, after the update's scope has
         # already closed.
@@ -134,46 +136,64 @@ class WriteLockMiddleware(BaseMiddleware):
     ) -> Any:
         slot = _DeliverySlot()
         data[DELIVERY_SLOT] = slot
-        async with self._lock:
+        async with self.lock:
             result = await handler(event, data)
 
         # The dishka scope has closed by now, so the transaction is committed
         # and the lock is gone. Only now do we touch the network.
         responder = slot.responder
         if responder is not None:
-            await responder.flush()
-            if responder.pinned_updates:
-                await self._store_pinned(responder)
+            # finally: a stale-message failure propagates to dp.errors, but the
+            # rows that DID go out must still be struck off, or the background
+            # sender would deliver them a second time.
+            try:
+                await responder.flush()
+            finally:
+                await self._settle(responder)
         return result
 
-    async def _store_pinned(self, responder: Responder) -> None:
-        """Record the id of a pinned status message that had to be recreated.
+    async def _settle(self, responder: Responder) -> None:
+        """Tie off what is only knowable after the send.
 
-        A second, very short transaction, because the id does not exist until
-        the message has been sent and sending now happens after the commit. Two
-        millisecond-long transactions instead of one that spanned a round trip
-        to Telegram is exactly the trade this change is made of.
+        A second, very short transaction — two millisecond-long ones instead of
+        one that spanned a round trip to Telegram, which is exactly the trade
+        this design is made of. Two things happen here:
 
-        Losing this write (the process dying in the narrow window after the
-        send) costs one orphaned pinned message: the next sync finds no stored
-        id and creates another one.
+        * delivered outbox rows are dropped (whatever is left, outbox.py keeps
+          retrying);
+        * the id of a pinned status message that had to be recreated is stored,
+          because that id does not exist until the message has been sent.
+
+        Losing this transaction is harmless either way: an undeleted outbox row
+        means one duplicate reply, and a lost pinned id means the next sync
+        creates another pinned message.
         """
+        delivered = responder.delivered()
+        if not delivered and not responder.pinned_updates:
+            return
         factory = await self._container.get(async_sessionmaker[AsyncSession])
-        async with self._lock, factory() as session:
+        async with self.lock, factory() as session:
+            if delivered:
+                await session.execute(delete(OutboxMessage).where(OutboxMessage.id.in_(delivered)))
             users = UserService(session)
             for user_id, message_id in responder.pinned_updates:
                 await users.set_pinned_message_id(user_id, message_id)
             await session.commit()
+        delivered.clear()
         responder.pinned_updates.clear()
 
 
 class ResponderMiddleware(BaseMiddleware):
-    """Hands the request scope's Responder out to WriteLockMiddleware.
+    """Hands the request scope's Responder out, and records its promises.
 
     Registered on ``dp.update`` *after* ``setup_dishka``: the Responder lives in
     the dishka scope, but the flush has to happen once that scope has closed and
     committed — that is, in WriteLockMiddleware, which sits outside it and can no
     longer resolve anything from the container.
+
+    The outbox rows are written here, on the way out, because this is the last
+    point still inside the transaction. A handler that raised never gets here,
+    which is the intended behaviour: no change, no promise to report one.
     """
 
     async def __call__(
@@ -182,11 +202,15 @@ class ResponderMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        container: AsyncContainer = data["dishka_container"]
+        responder = await container.get(Responder)
         slot: _DeliverySlot | None = data.get(DELIVERY_SLOT)
         if slot is not None:
-            container: AsyncContainer = data["dishka_container"]
-            slot.responder = await container.get(Responder)
-        return await handler(event, data)
+            slot.responder = responder
+
+        result = await handler(event, data)
+        await responder.persist(await container.get(AsyncSession))
+        return result
 
 
 # Telegram keeps unconfirmed updates for a day, so a week of marks is ample and
