@@ -1,6 +1,7 @@
 import asyncio
 
 from chain_health.bot import texts as bot_texts
+from chain_health.db import engine as engine_module
 from chain_health.services.access import AccessService
 from tests.bot_harness import make_update_message
 
@@ -54,3 +55,34 @@ async def test_two_concurrent_first_contacts_from_the_same_new_user_both_succeed
     assert bot_texts.ERR_UNEXPECTED not in sent_texts
     assert bot_texts.MENU_ROOT in sent_texts
     assert any("Добавь группу" in t for t in sent_texts)
+
+
+async def test_concurrent_updates_do_not_rely_on_busy_timeout(harness, monkeypatch):
+    """With the busy handler disabled entirely, concurrent updates still work.
+
+    This pins *what* serializes writers. `busy_timeout` (db/engine.py) makes a
+    second writer wait rather than fail, and that wait is long because a handler
+    holds its transaction across Telegram round-trips — so the timeout papers
+    over a missing lock right up until traffic outgrows it, then starts dropping
+    updates with "database is locked". WriteLockMiddleware makes the contention
+    not happen at all; setting the timeout to zero proves the difference,
+    because with no lock the second BEGIN IMMEDIATE would fail on the spot.
+
+    Patched on the module, not on the engine: the pragma statement reads the
+    global when a connection is opened, and the container's engine has not
+    opened one yet.
+    """
+    monkeypatch.setattr(engine_module, "_BUSY_TIMEOUT_MS", 0)
+
+    await asyncio.gather(
+        *(
+            harness.dp.feed_update(
+                harness.bot, make_update_message("/menu", user_id=1, update_id=300 + i)
+            )
+            for i in range(8)
+        )
+    )
+
+    sent_texts = harness.session.sent_texts()
+    assert bot_texts.ERR_UNEXPECTED not in sent_texts
+    assert sent_texts.count(bot_texts.MENU_ROOT) == 8, "каждый апдейт обязан получить ответ"
