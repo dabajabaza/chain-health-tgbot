@@ -39,9 +39,11 @@ from aiogram.types import (
     MaybeInaccessibleMessageUnion,
     Message,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from chain_health.bot import keyboards, texts
 from chain_health.bot.parsing import parse_positive_float
+from chain_health.db.models import OutboxMessage
 from chain_health.domain.errors import StaleMessageError
 from chain_health.services.status import StatusService
 from chain_health.services.users import UserService
@@ -49,6 +51,17 @@ from chain_health.services.users import UserService
 logger = logging.getLogger(__name__)
 
 _BENIGN_EDIT_ERRORS = ("message is not modified",)
+
+
+def _dump(method: TelegramMethod[Any]) -> str:
+    """An aiogram method as JSON — only the fields the caller set explicitly.
+
+    exclude_unset is required, not a size optimization: an unset field holds
+    aiogram's `Default` sentinel, which asks for a bot-level setting at send
+    time. It is not serializable, and it should not be — on revival the field
+    is unset again and picks up the default again.
+    """
+    return method.model_dump_json(exclude_unset=True)
 
 
 def is_benign_edit_error(exc: TelegramBadRequest) -> bool:
@@ -117,6 +130,10 @@ class _Call:
 
     method: TelegramMethod[Any]
     on_error: OnError = "raise"
+    # Whether this call should survive the process dying — see db.models.OutboxMessage.
+    durable: bool = False
+    # Set when the promise is written into the transaction.
+    outbox_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -148,6 +165,7 @@ class Responder:
         self._users = users
         self._status_service = status_service
         self._queue: list[_Call | _PinnedSync] = []
+        self._delivered: list[int] = []
         # Filled by flush, drained by the middleware in a second short
         # transaction: a recreated pinned message only has an id once sent.
         self.pinned_updates: list[tuple[int, int]] = []
@@ -160,7 +178,9 @@ class Responder:
         """Send a message with a fresh reply-keyboard placeholder; sync the pin if data changed."""
         view = await self._status_service.build(user_id)
         keyboard = keyboards.main_reply_keyboard(texts.placeholder_text(view))
-        self._queue.append(_Call(SendMessage(chat_id=chat_id, text=text, reply_markup=keyboard)))
+        self._queue.append(
+            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=keyboard), durable=True)
+        )
         if data_changed:
             await self.sync_pinned(chat_id, user_id)
 
@@ -177,7 +197,7 @@ class Responder:
         # Telegram allows only one keyboard type per message, so the reply-keyboard
         # placeholder is not refreshed here — it catches up on the next plain reply().
         self._queue.append(
-            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup))
+            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup), durable=True)
         )
         if data_changed:
             await self.sync_pinned(chat_id, user_id)
@@ -207,7 +227,7 @@ class Responder:
         would be pure cost — nothing about it has changed.
         """
         self._queue.append(
-            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup))
+            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup), durable=True)
         )
 
     def edit(
@@ -227,6 +247,7 @@ class Responder:
                     reply_markup=reply_markup,
                 ),
                 on_error="not_modified",
+                durable=True,
             )
         )
 
@@ -257,6 +278,33 @@ class Responder:
         """How many intents are waiting — for tests and diagnostics."""
         return len(self._queue)
 
+    async def persist(self, session: AsyncSession) -> None:
+        """Write the delivery promises into the same transaction as the change.
+
+        Called by the middleware *before* the commit, so either both the change
+        and the promise to report it are recorded, or neither is. Otherwise a
+        process dying between the commit and the send would leave an applied
+        operation with nobody told about it — which is precisely what reordering
+        send and commit must not cost.
+        """
+        rows = [
+            (item, OutboxMessage(method=type(item.method).__name__, payload=_dump(item.method)))
+            for item in self._queue
+            if isinstance(item, _Call) and item.durable
+        ]
+        if not rows:
+            return
+        session.add_all([row for _item, row in rows])
+        # flush, not commit: the ids are needed right here so a successful send
+        # has something to delete. The unit of work still owns the commit.
+        await session.flush()
+        for item, row in rows:
+            item.outbox_id = row.id
+
+    def delivered(self) -> list[int]:
+        """Outbox row ids whose messages went out. The middleware deletes them."""
+        return self._delivered
+
     def discard(self) -> None:
         """Drop what was recorded without sending it.
 
@@ -272,11 +320,42 @@ class Responder:
         path, say) cannot deliver the same message twice.
         """
         queued, self._queue = self._queue, []
+        stale: StaleMessageError | None = None
         for item in queued:
             if isinstance(item, _PinnedSync):
                 await self._sync_pinned(item)
-            else:
+                continue
+            try:
                 await self._call(item)
+            except StaleMessageError as exc:
+                # Telegram says the target message is gone or unusable. Not
+                # transient — retrying cannot fix it — so the promise is dropped
+                # rather than queued. Re-raised below so dp.errors still runs:
+                # a handler that opened a dialog and then failed to show its
+                # prompt leaves an FSM state that would swallow the user's next
+                # message, and clearing it is on_error's job.
+                stale = stale or exc
+                if item.outbox_id is not None:
+                    self._delivered.append(item.outbox_id)
+            except Exception:
+                # Everything else is treated as transient: the update is applied
+                # and committed by now, and no network mishap may undo it or
+                # turn into an error toast for an operation that succeeded.
+                # Durable calls stay in the outbox and get retried.
+                logger.warning(
+                    "Could not send %s%s",
+                    type(item.method).__name__,
+                    " — left queued" if item.outbox_id else "",
+                    exc_info=True,
+                )
+            else:
+                if item.outbox_id is not None:
+                    self._delivered.append(item.outbox_id)
+
+        # Raised only once the rest of the queue has gone out — the callback
+        # answer that stops the spinner is usually queued behind the edit.
+        if stale is not None:
+            raise stale
 
     async def _call(self, item: _Call) -> None:
         try:

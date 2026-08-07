@@ -267,3 +267,40 @@ class ProcessedUpdate(Base):
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime, default=utcnow, comment="UTC instant the update was applied"
     )
+
+
+class OutboxMessage(Base):
+    """A promise to deliver a reply, made in the same transaction as the change.
+
+    Sending after the commit (see bot/ui.py) lifted the throughput ceiling, but
+    it broke the link between "the change was applied" and "the user knows it":
+    a network failure after the commit leaves the user in the dark. They then
+    repeat the action — and a ride gets logged twice, which is exactly the
+    duplicate ProcessedUpdate exists to prevent.
+
+    The row is written with the business change and deleted once the message is
+    out. If it could not be sent, the row stays and the background sender
+    (outbox.py) keeps trying. The guarantee is at-least-once: a duplicated reply
+    is harmless, a lost one is not.
+
+    Not everything is queued. Telegram accepts an answer to a callback query for
+    seconds only, so storing one is pointless; clearing a spent keyboard is
+    cosmetic; the pinned status sync is best-effort by D10 and rebuilds itself
+    on the next update anyway. What is durable are the calls that carry the
+    result of an operation.
+    """
+
+    __tablename__ = "outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    method: Mapped[str] = mapped_column(comment="aiogram method class name, e.g. SendMessage")
+    payload: Mapped[str] = mapped_column(comment="the method serialized as JSON")
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, default=utcnow, comment="UTC instant the promise was made"
+    )
+    attempts: Mapped[int] = mapped_column(default=0, comment="failed delivery attempts so far")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        UTCDateTime, default=utcnow, comment="UTC instant before which not to retry (backoff)"
+    )
+
+    __table_args__ = (Index("ix_outbox_next_attempt", "next_attempt_at"),)

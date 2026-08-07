@@ -9,6 +9,7 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from dishka import AsyncContainer
 from dishka.integrations.aiogram import ContainerMiddleware, setup_dishka
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from chain_health.bot.errors import on_error
 from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
@@ -21,6 +22,7 @@ from chain_health.bot.middlewares import (
 )
 from chain_health.config import Settings
 from chain_health.di import build_container
+from chain_health.outbox import run_sender
 from chain_health.scheduler import run_reminder_scheduler
 from chain_health.watchdog import run_watchdog, sd_notify
 
@@ -82,7 +84,11 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     # dishka scope closes, so the lock has to be *outside* ContainerMiddleware
     # to still be held at that moment — and released before the replies go out.
     # See WriteLockMiddleware.
-    dp.update.outer_middleware(WriteLockMiddleware(container))
+    write_lock = WriteLockMiddleware(container)
+    dp.update.outer_middleware(write_lock)
+    # The outbox sender needs the same lock; the dispatcher's workflow data is
+    # how build_dispatcher hands it to the caller.
+    dp["write_lock"] = write_lock.lock
 
     dp.include_router(admin.router)
     dp.include_router(start.router)
@@ -132,10 +138,14 @@ async def _run_bot(settings: Settings) -> None:
     watchdog_task = asyncio.create_task(
         run_watchdog(bot, interval=_WATCHDOG_INTERVAL, probe_timeout=_WATCHDOG_PROBE_TIMEOUT)
     )
+    # Finishes off replies whose delivery never happened — usually because the
+    # process died between the commit and the send, which a deploy does on purpose.
+    session_factory = await container.get(async_sessionmaker[AsyncSession])
+    outbox_task = asyncio.create_task(run_sender(bot, session_factory, dp["write_lock"]))
     try:
         await dp.start_polling(bot)
     finally:
-        for task in (scheduler_task, watchdog_task):
+        for task in (scheduler_task, watchdog_task, outbox_task):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
