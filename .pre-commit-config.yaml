@@ -1,4 +1,12 @@
 repos:
+  # Репозиторий публичный, поэтому утёкший секрет уже не спрячешь — его придётся
+  # отзывать. Ловим до коммита. detect-private-key берёт только PEM/SSH-блоки,
+  # токены ботов и API-ключи находит именно gitleaks.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.0
     hooks:
@@ -14,6 +22,7 @@ repos:
       - id: check-merge-conflict
       - id: check-toml
       - id: check-added-large-files
+      - id: detect-private-key
 
   - repo: local
     hooks:
