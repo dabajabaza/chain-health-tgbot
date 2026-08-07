@@ -8,7 +8,7 @@ from aiogram.types import BotCommand
 from alembic import command
 from alembic.config import Config as AlembicConfig
 from dishka import AsyncContainer
-from dishka.integrations.aiogram import setup_dishka
+from dishka.integrations.aiogram import ContainerMiddleware, setup_dishka
 
 from chain_health.bot.errors import on_error
 from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
@@ -39,6 +39,35 @@ def _run_migrations() -> None:
     command.upgrade(cfg, "head")
 
 
+# dishka's setup_dishka() opens a REQUEST scope on *every* aiogram observer.
+# aiogram nests observers — an incoming message runs the `update` chain, which
+# then propagates into the `message` chain — so out of the box a single update
+# entered two sibling REQUEST scopes and got two AsyncSessions on two
+# connections: one for IdempotencyMiddleware (registered on `update`), another
+# for AuthMiddleware and the handler (`message`/`callback_query`). That breaks
+# the unit of work both di.py and IdempotencyMiddleware document: the
+# processed_updates mark committed in a *different* transaction than the
+# business change it is supposed to be atomic with, so a crash in the window
+# between the two commits still replayed the update. It is also a deadlock
+# against real SQLite transactions (see db/engine.py): the outer scope holds a
+# transaction open across the inner scope's writes.
+#
+# The `error` observer keeps its own scope on purpose: aiogram propagates an
+# error only after the update chain's outer middlewares have unwound, so the
+# scope that raised is already closed by the time on_error runs.
+_SCOPE_OWNING_OBSERVERS = frozenset({"update", "error"})
+
+
+def _collapse_dishka_scopes(dp: Dispatcher) -> None:
+    """Leave exactly one dishka REQUEST scope per update."""
+    for name, observer in dp.observers.items():
+        if name in _SCOPE_OWNING_OBSERVERS:
+            continue
+        for middleware in list(observer.outer_middleware):
+            if isinstance(middleware, ContainerMiddleware):
+                observer.outer_middleware.unregister(middleware)
+
+
 def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     """Wires routers, the private-chat gate, dishka, and the auth middleware
     in the one order that matters — shared by production and the test harness
@@ -59,6 +88,7 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     dp.errors.register(on_error)
 
     setup_dishka(container, dp, auto_inject=True)
+    _collapse_dishka_scopes(dp)
     # After dishka (needs the request-scoped session) and before auth: a
     # redelivered update must not reach ensure_registered either.
     dp.update.middleware(IdempotencyMiddleware())
