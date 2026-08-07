@@ -36,7 +36,10 @@ jobs:
           "$RUNNER_TEMP/gitleaks/gitleaks" detect \
             --source . --log-opts=--all --no-banner --redact
 
-      - uses: astral-sh/setup-uv@v9
+      # Точная версия, а не major-тег: setup-uv публикует подвижные теги только
+      # до v7, хотя релизы дошли до 9.0.0. Ссылка @v9 не разрешается, и job
+      # падает ещё на «Set up job», не дойдя ни до одного шага.
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
 
