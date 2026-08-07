@@ -9,10 +9,12 @@ from aiogram.enums import ChatType
 from aiogram.types import Message, TelegramObject
 from dishka import AsyncContainer
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from chain_health.bot.ui import Responder
 from chain_health.db.models import ProcessedUpdate
 from chain_health.services.access import AccessService
+from chain_health.services.users import UserService
 from chain_health.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -74,23 +76,42 @@ class PrivateChatOnlyMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+DELIVERY_SLOT = "delivery_slot"
+
+
+class _DeliverySlot:
+    """Carries the request scope's Responder back out to the flush.
+
+    A mutable object, not a plain ``data`` key, because aiogram rebuilds the
+    context dict between observers (``propagate_event(..., **kwargs)``): a key
+    written by an inner middleware is invisible to the outer one that has to
+    read it. The slot itself is passed by reference, so both sides see the same
+    object no matter how many times the dict around it is copied.
+    """
+
+    def __init__(self) -> None:
+        self.responder: Responder | None = None
+
+
 class WriteLockMiddleware(BaseMiddleware):
-    """Serializes request scopes, because SQLite allows exactly one writer.
+    """Serializes request scopes and delivers their replies afterwards.
 
     Registered on ``dp.update.outer_middleware`` *before* ``setup_dishka``, and
     that ordering is the whole point: the unit of work commits when the dishka
     scope closes (see di.py ``RequestProvider.session``), which happens inside
     ``ContainerMiddleware``. A lock registered after it would be released before
     the commit it is supposed to cover, and the next update would read state the
-    previous one had not yet written.
+    previous one had not yet written. Sitting outside also means the lock is
+    already released when the replies go out — which is what keeps the network
+    off the write path.
 
-    Without it, concurrency is arbitrated by ``busy_timeout`` (db/engine.py):
-    the second writer blocks inside SQLite's busy handler and dies with
-    "database is locked" once the wait runs out. That turns a queue into a
-    deadline — and the wait is long, because a handler holds its transaction
-    across Telegram round-trips. Here the second writer waits on an asyncio lock
-    instead: no timeout, no busy-handler spinning, and the event loop stays free
-    to do the network I/O of updates that are already past their commit.
+    SQLite allows exactly one writer. Without this lock, concurrency is
+    arbitrated by ``busy_timeout`` (db/engine.py): the second writer blocks
+    inside SQLite's busy handler and dies with "database is locked" once the
+    wait runs out. That turns a queue into a deadline. Here the second writer
+    waits on an asyncio lock instead: no timeout, no busy-handler spinning, and
+    the event loop stays free to do the network I/O of updates that are already
+    past their commit.
 
     ``BEGIN IMMEDIATE`` stays as-is. This lock covers writers inside the
     process, which D1's single-process bot makes sufficient in practice, but an
@@ -98,8 +119,12 @@ class WriteLockMiddleware(BaseMiddleware):
     still an outside writer.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, container: AsyncContainer) -> None:
         self._lock = asyncio.Lock()
+        # The app-level container, not a request scope: the follow-up
+        # transaction below opens its own session, after the update's scope has
+        # already closed.
+        self._container = container
 
     async def __call__(
         self,
@@ -107,8 +132,61 @@ class WriteLockMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        slot = _DeliverySlot()
+        data[DELIVERY_SLOT] = slot
         async with self._lock:
-            return await handler(event, data)
+            result = await handler(event, data)
+
+        # The dishka scope has closed by now, so the transaction is committed
+        # and the lock is gone. Only now do we touch the network.
+        responder = slot.responder
+        if responder is not None:
+            await responder.flush()
+            if responder.pinned_updates:
+                await self._store_pinned(responder)
+        return result
+
+    async def _store_pinned(self, responder: Responder) -> None:
+        """Record the id of a pinned status message that had to be recreated.
+
+        A second, very short transaction, because the id does not exist until
+        the message has been sent and sending now happens after the commit. Two
+        millisecond-long transactions instead of one that spanned a round trip
+        to Telegram is exactly the trade this change is made of.
+
+        Losing this write (the process dying in the narrow window after the
+        send) costs one orphaned pinned message: the next sync finds no stored
+        id and creates another one.
+        """
+        factory = await self._container.get(async_sessionmaker[AsyncSession])
+        async with self._lock, factory() as session:
+            users = UserService(session)
+            for user_id, message_id in responder.pinned_updates:
+                await users.set_pinned_message_id(user_id, message_id)
+            await session.commit()
+        responder.pinned_updates.clear()
+
+
+class ResponderMiddleware(BaseMiddleware):
+    """Hands the request scope's Responder out to WriteLockMiddleware.
+
+    Registered on ``dp.update`` *after* ``setup_dishka``: the Responder lives in
+    the dishka scope, but the flush has to happen once that scope has closed and
+    committed — that is, in WriteLockMiddleware, which sits outside it and can no
+    longer resolve anything from the container.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        slot: _DeliverySlot | None = data.get(DELIVERY_SLOT)
+        if slot is not None:
+            container: AsyncContainer = data["dishka_container"]
+            slot.responder = await container.get(Responder)
+        return await handler(event, data)
 
 
 # Telegram keeps unconfirmed updates for a day, so a week of marks is ample and

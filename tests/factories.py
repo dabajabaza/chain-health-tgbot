@@ -50,6 +50,9 @@ class FakeNotifier:
             raise self.raises
         self.sent.append((user_id, status))
 
+    async def deliver_pending(self) -> None:
+        """Nothing to deliver: send_reminder already recorded into `sent`."""
+
 
 async def make_user(session, user_id: int = 1) -> User:
     user = User(id=user_id)

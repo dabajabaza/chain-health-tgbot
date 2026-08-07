@@ -16,3 +16,6 @@ class TelegramReminderNotifier:
 
     async def send_reminder(self, user_id: int, status: ChainStatus) -> None:
         await self._responder.reply(user_id, user_id, texts.reminder_text(status))
+
+    async def deliver_pending(self) -> None:
+        await self._responder.flush()

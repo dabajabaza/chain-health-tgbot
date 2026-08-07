@@ -16,6 +16,7 @@ from chain_health.bot.middlewares import (
     AuthMiddleware,
     IdempotencyMiddleware,
     PrivateChatOnlyMiddleware,
+    ResponderMiddleware,
     WriteLockMiddleware,
 )
 from chain_health.config import Settings
@@ -79,8 +80,9 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     # After the private-chat gate (group traffic has no business queueing for a
     # write lock) and before setup_dishka: the unit of work commits as the
     # dishka scope closes, so the lock has to be *outside* ContainerMiddleware
-    # to still be held at that moment. See WriteLockMiddleware.
-    dp.update.outer_middleware(WriteLockMiddleware())
+    # to still be held at that moment — and released before the replies go out.
+    # See WriteLockMiddleware.
+    dp.update.outer_middleware(WriteLockMiddleware(container))
 
     dp.include_router(admin.router)
     dp.include_router(start.router)
@@ -97,6 +99,7 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     _collapse_dishka_scopes(dp)
     # After dishka (needs the request-scoped session) and before auth: a
     # redelivered update must not reach ensure_registered either.
+    dp.update.middleware(ResponderMiddleware())
     dp.update.middleware(IdempotencyMiddleware())
     auth = AuthMiddleware()
     dp.message.outer_middleware(auth)

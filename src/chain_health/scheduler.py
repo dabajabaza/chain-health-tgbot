@@ -5,6 +5,7 @@ from datetime import timedelta
 from dishka import AsyncContainer
 
 from chain_health.config import Settings
+from chain_health.domain.ports import ReminderNotifier
 from chain_health.services.reminders import ReminderService
 from chain_health.timeutils import local_now, local_today
 
@@ -63,8 +64,13 @@ async def send_due_reminders(container: AsyncContainer, settings: Settings) -> i
         try:
             async with container() as scope:
                 reminders = await scope.get(ReminderService)
+                notifier = await scope.get(ReminderNotifier)
                 if await reminders.send_due_reminder(user_id, today):
                     sent += 1
+            # Outside the scope on purpose: the mark_reminded write is committed
+            # by now, so the network call no longer holds a transaction open
+            # against the bot's own updates.
+            await notifier.deliver_pending()
         except Exception:
             logger.exception("Failed to send a reminder to user %s", user_id)
     return sent

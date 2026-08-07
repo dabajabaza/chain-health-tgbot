@@ -19,28 +19,31 @@ async def cmd_start(
     message: Message,
     state: FSMContext,
     garage: FromDishka[GarageService],
+    responder: FromDishka[Responder],
 ) -> None:
     groups = await garage.list_groups(message_user_id(message))
     if groups:
         await state.clear()
-        await message.answer(texts.WELCOME_BACK)
+        responder.reply_raw(message.chat.id, texts.WELCOME_BACK)
         return
     await state.set_state(Onboarding.group_name)
-    await message.answer(texts.ONBOARDING_ASK_GROUP_NAME)
+    responder.reply_raw(message.chat.id, texts.ONBOARDING_ASK_GROUP_NAME)
 
 
 @router.message(Onboarding.group_name)
-async def onboarding_group_name(message: Message, state: FSMContext) -> None:
+async def onboarding_group_name(
+    message: Message, state: FSMContext, responder: FromDishka[Responder]
+) -> None:
     name = (message.text or "").strip()
     if not name:
-        await message.answer(texts.ONBOARDING_ASK_GROUP_NAME)
+        responder.reply_raw(message.chat.id, texts.ONBOARDING_ASK_GROUP_NAME)
         return
     if len(name) > MAX_NAME_LENGTH:
-        await message.answer(texts.ASK_NAME_TOO_LONG_RETRY)
+        responder.reply_raw(message.chat.id, texts.ASK_NAME_TOO_LONG_RETRY)
         return
     await state.update_data(group_name=name)
     await state.set_state(Onboarding.chain_name)
-    await message.answer(texts.ONBOARDING_ASK_CHAIN_NAME)
+    responder.reply_raw(message.chat.id, texts.ONBOARDING_ASK_CHAIN_NAME)
 
 
 @router.message(Onboarding.chain_name)
@@ -52,10 +55,10 @@ async def onboarding_chain_name(
 ) -> None:
     chain_name = (message.text or "").strip()
     if not chain_name:
-        await message.answer(texts.ONBOARDING_ASK_CHAIN_NAME)
+        responder.reply_raw(message.chat.id, texts.ONBOARDING_ASK_CHAIN_NAME)
         return
     if len(chain_name) > MAX_NAME_LENGTH:
-        await message.answer(texts.ASK_NAME_TOO_LONG_RETRY)
+        responder.reply_raw(message.chat.id, texts.ASK_NAME_TOO_LONG_RETRY)
         return
 
     data = await state.get_data()

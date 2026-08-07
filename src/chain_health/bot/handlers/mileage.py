@@ -22,14 +22,14 @@ async def add_mileage(
 ) -> None:
     distance_km = parse_positive_float(message.text, max_value=MAX_DISTANCE_KM)
     if distance_km is None:
-        await message.answer(texts.ASK_DISTANCE_RETRY)
+        responder.reply_raw(message.chat.id, texts.ASK_DISTANCE_RETRY)
         return
 
     user_id = message_user_id(message)
     try:
         recorded = await mileage.record_ride(user_id=user_id, distance_km=distance_km)
     except NoActiveChainError:
-        await message.answer(texts.NO_ACTIVE_CHAIN)
+        responder.reply_raw(message.chat.id, texts.NO_ACTIVE_CHAIN)
         return
 
     text = texts.ride_recorded_text(recorded.group.name, recorded.status, distance_km)

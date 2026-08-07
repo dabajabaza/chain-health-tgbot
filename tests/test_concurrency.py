@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 
 from chain_health.bot import texts as bot_texts
 from chain_health.db import engine as engine_module
@@ -85,4 +86,50 @@ async def test_concurrent_updates_do_not_rely_on_busy_timeout(harness, monkeypat
 
     sent_texts = harness.session.sent_texts()
     assert bot_texts.ERR_UNEXPECTED not in sent_texts
-    assert sent_texts.count(bot_texts.MENU_ROOT) == 8, "каждый апдейт обязан получить ответ"
+    assert sent_texts.count(bot_texts.MENU_ROOT) == 8, "every update must get its reply"
+
+
+def _write_lock_free(db_path) -> bool:
+    """Whether the database can be written to right now.
+
+    Raw sqlite3 on its own connection, with no wait and outside SQLAlchemy's
+    pool, so the answer is about the file rather than about what the engine has
+    cached. Under WAL, BEGIN IMMEDIATE does not block on readers and fails only
+    on somebody else's write lock — exactly what needs measuring.
+    """
+    con = sqlite3.connect(db_path, timeout=0)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.rollback()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
+async def test_the_database_is_free_while_talking_to_telegram(harness, db_path):
+    """The property the whole send-after-commit ordering exists for.
+
+    While sending sat inside the transaction, SQLite's single write lock stayed
+    held for the entire round trip to Telegram, and the bot's ceiling was a
+    handful of updates per second regardless of load. Handlers now only record
+    intent (bot/ui.py) and delivery happens after the commit.
+
+    Asked literally: on every call to Telegram, ask the database whether it is
+    writable. A single busy answer means the network has crept back inside the
+    transaction.
+    """
+    free: list[bool] = []
+    original = harness.session.make_request
+
+    async def probing(*args, **kwargs):
+        free.append(_write_lock_free(db_path))
+        return await original(*args, **kwargs)
+
+    harness.session.make_request = probing
+
+    await harness.dp.feed_update(harness.bot, make_update_message("125", user_id=1, update_id=401))
+
+    assert free, "the update should have talked to Telegram"
+    assert all(free), "the update's transaction must be closed before any Telegram call"
