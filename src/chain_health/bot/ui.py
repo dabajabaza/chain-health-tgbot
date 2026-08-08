@@ -75,7 +75,7 @@ def is_benign_edit_error(exc: TelegramBadRequest) -> bool:
     return any(pattern in message for pattern in _BENIGN_EDIT_ERRORS)
 
 
-def require_editable(message: MaybeInaccessibleMessageUnion | None) -> Message:
+def _require_editable(message: MaybeInaccessibleMessageUnion | None) -> Message:
     """The message behind an inline keyboard, if it can still be edited.
 
     Checked when the intent is recorded, not when it is sent: a callback whose
@@ -254,7 +254,7 @@ class Responder:
         operation is applied either way and the next screen shows the truth —
         cheaper than teleporting the user into the past.
         """
-        editable = require_editable(message)
+        editable = _require_editable(message)
         self._queue.append(
             _Call(
                 EditMessageText(
