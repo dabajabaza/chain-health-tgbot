@@ -670,6 +670,16 @@ latent bugs into loud ones:
   `bot/errors.py`). Pinned by
   `tests/test_di.py::test_one_update_runs_in_exactly_one_request_scope`.
 
+**A denied update is not marked.** The redelivery *check* runs before the
+handler — a duplicate must never slip through — but the row is written after
+it, and only if the update was actually handled. Marking a rejected update was
+never wrong (its redelivery has nothing to repeat), but it was not free: the
+bot is findable by name in Telegram search (D4), so unauthorized traffic is
+normal, and every such message took the process-wide write lock and committed a
+row — spending the throughput D10 had just freed on someone the bot does not
+answer. The mark bought nothing back, since the next spam message carries a new
+update_id.
+
 **Consequences:** A plain read-then-write (`get`, check, then `add`/`update`)
 is not safe for either case, even on SQLite, even single-process — the
 `await` points in between are exactly where the second task's turn runs.
