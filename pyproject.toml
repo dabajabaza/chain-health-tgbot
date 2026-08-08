@@ -46,7 +46,10 @@ testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.12"
-plugins = ["sqlalchemy.ext.mypy.plugin", "pydantic.mypy"]
+# pydantic.mypy only: the legacy SQLAlchemy plugin is unnecessary for
+# Mapped[...] models and deprecated — the first upgrade that drops it would
+# break mypy startup in CI with an error unrelated to any code change.
+plugins = ["pydantic.mypy"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

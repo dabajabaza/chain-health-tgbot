@@ -9,7 +9,7 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from dishka import AsyncContainer
 from dishka.integrations.aiogram import ContainerMiddleware, setup_dishka
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from chain_health.bot.errors import on_error
 from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
@@ -72,7 +72,7 @@ def _collapse_dishka_scopes(dp: Dispatcher) -> None:
                 observer.outer_middleware.unregister(middleware)
 
 
-def build_dispatcher(container: AsyncContainer) -> Dispatcher:
+def build_dispatcher(container: AsyncContainer) -> tuple[Dispatcher, asyncio.Lock]:
     """Wires routers, the private-chat gate, dishka, and the auth middleware
     in the one order that matters — shared by production and the test harness
     so the two can never diverge (see docs/ARCHITECTURE.md D3).
@@ -84,11 +84,13 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     # dishka scope closes, so the lock has to be *outside* ContainerMiddleware
     # to still be held at that moment — and released before the replies go out.
     # See WriteLockMiddleware.
-    write_lock = WriteLockMiddleware(container)
-    dp.update.outer_middleware(write_lock)
-    # The outbox sender needs the same lock; the dispatcher's workflow data is
-    # how build_dispatcher hands it to the caller.
-    dp["write_lock"] = write_lock.lock
+    write_lock_mw = WriteLockMiddleware(container)
+    dp.update.outer_middleware(write_lock_mw)
+    # The outbox sender needs the same lock. Returned to the caller rather than
+    # stashed under a magic dp["…"] key: a typo in a string key (or a future
+    # builder that forgets to set it) silently splits the single writer into
+    # two locks — the loser dies "database is locked" after busy_timeout.
+    dp["write_lock"] = write_lock_mw.lock  # kept for introspection only
 
     dp.include_router(admin.router)
     dp.include_router(start.router)
@@ -111,7 +113,7 @@ def build_dispatcher(container: AsyncContainer) -> Dispatcher:
     dp.message.outer_middleware(auth)
     dp.callback_query.outer_middleware(auth)
 
-    return dp
+    return dp, write_lock_mw.lock
 
 
 async def _set_commands(bot: Bot) -> None:
@@ -126,7 +128,7 @@ async def _set_commands(bot: Bot) -> None:
 async def _run_bot(settings: Settings) -> None:
     container = build_container(settings)
     bot = await container.get(Bot)
-    dp = build_dispatcher(container)
+    dp, write_lock = build_dispatcher(container)
 
     await _set_commands(bot)
 
@@ -141,7 +143,8 @@ async def _run_bot(settings: Settings) -> None:
     # Finishes off replies whose delivery never happened — usually because the
     # process died between the commit and the send, which a deploy does on purpose.
     session_factory = await container.get(async_sessionmaker[AsyncSession])
-    outbox_task = asyncio.create_task(run_sender(bot, session_factory, dp["write_lock"]))
+    engine = await container.get(AsyncEngine)
+    outbox_task = asyncio.create_task(run_sender(bot, session_factory, engine, write_lock))
     try:
         await dp.start_polling(bot)
     finally:

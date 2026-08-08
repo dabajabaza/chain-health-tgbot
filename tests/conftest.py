@@ -121,10 +121,10 @@ async def harness(container: AsyncContainer) -> AsyncIterator[BotHarness]:
     session = RecordingSession()
     bot.session = session
 
-    dp = build_dispatcher(container)
+    dp, write_lock = build_dispatcher(container)
     await dp.emit_startup()
     try:
-        yield BotHarness(bot=bot, dp=dp, session=session)
+        yield BotHarness(bot=bot, dp=dp, session=session, write_lock=write_lock)
     finally:
         await dp.emit_shutdown()
         for router in _SHARED_ROUTERS:

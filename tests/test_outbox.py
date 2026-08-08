@@ -10,7 +10,6 @@ change; a successful send deletes it; a failed one leaves it for the background
 sender. At-least-once: a duplicated reply is harmless, a lost one is not.
 """
 
-import asyncio
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -73,7 +72,7 @@ async def test_a_failed_send_leaves_a_promise_that_gets_retried(harness, session
 
     harness.session.clear()
     await _make_due(session_factory)
-    sent = await outbox.deliver_batch(harness.bot, session_factory, asyncio.Lock())
+    sent, _carry = await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock)
 
     assert sent == 1
     assert harness.session.calls_of("SendMessage")
@@ -89,7 +88,7 @@ async def test_a_retried_reply_does_not_repeat_the_ride(harness, session_factory
     del harness.session.fail_on["SendMessage"]
 
     await _make_due(session_factory)
-    await outbox.deliver_batch(harness.bot, session_factory, asyncio.Lock())
+    await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock)
     assert await _rides(session_factory) == [42.0], "the ride must not be logged twice"
 
 
@@ -101,7 +100,7 @@ async def test_a_failed_retry_backs_off(harness, session_factory):
     await harness.send("42", user_id=1)
 
     await _make_due(session_factory)
-    sent = await outbox.deliver_batch(harness.bot, session_factory, asyncio.Lock())
+    sent, _carry = await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock)
 
     assert sent == 0
     queued = await _queued(session_factory)
@@ -138,7 +137,7 @@ async def test_an_expired_promise_is_dropped(harness, session_factory):
         row.created_at = row.created_at - outbox.TTL * 2
         await s.commit()
 
-    await outbox.purge_expired(session_factory, asyncio.Lock())
+    await outbox.purge_expired(session_factory, harness.write_lock)
     assert await _queued(session_factory) == []
 
 
@@ -156,7 +155,7 @@ async def test_an_unreadable_promise_does_not_block_the_queue(harness, session_f
         await s.commit()
 
     await _make_due(session_factory)
-    await outbox.deliver_batch(harness.bot, session_factory, asyncio.Lock())
+    await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock)
     assert await _queued(session_factory) == []
 
 
@@ -170,7 +169,7 @@ async def test_a_fresh_row_is_invisible_to_the_sender(harness, session_factory):
     del harness.session.fail_on["SendMessage"]
 
     assert len(await _queued(session_factory)) == 1, "the promise must be recorded"
-    assert await outbox.deliver_batch(harness.bot, session_factory, asyncio.Lock()) == 0
+    assert (await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock))[0] == 0
     assert len(await _queued(session_factory)) == 1, "the row must wait its turn"
 
 
@@ -210,3 +209,85 @@ async def test_failed_bookkeeping_does_not_turn_success_into_an_error(
 
     assert await _rides(session_factory) == [42.0], "the ride must be recorded"
     assert bot_texts.ERR_UNEXPECTED not in harness.session.sent_texts()
+
+
+async def test_failed_bookkeeping_does_not_loop_duplicates(harness, session_factory, monkeypatch):
+    """The batch went out but its fate could not be written (outside writer,
+    full disk). The loop used to swallow the exception and resend the same
+    batch five seconds later, forever. The unwritten outcome now comes back to
+    the caller, and nothing new may be sent until it is recorded."""
+    await onboard(harness)
+    harness.session.fail_on["SendMessage"] = RuntimeError("network down")
+    await harness.send("42", user_id=1)
+    del harness.session.fail_on["SendMessage"]
+    await _make_due(session_factory)
+
+    real_apply = outbox._apply_outcome
+    boom = {"left": 1}
+
+    async def flaky_apply(sf, lock, outcome):
+        if boom["left"]:
+            boom["left"] -= 1
+            raise RuntimeError("database held by an outside writer")
+        await real_apply(sf, lock, outcome)
+
+    monkeypatch.setattr(outbox, "_apply_outcome", flaky_apply)
+
+    harness.session.clear()
+    sent, carry = await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock)
+    assert sent == 1 and carry, "the outcome must come back unwritten"
+    first_batch = len(harness.session.calls_of("SendMessage"))
+
+    await outbox._apply_outcome(session_factory, harness.write_lock, carry)
+    assert len(harness.session.calls_of("SendMessage")) == first_batch, (
+        "nothing may be re-sent before the outcome is recorded"
+    )
+    assert await _queued(session_factory) == []
+
+
+async def test_an_empty_poll_takes_no_write_transaction(harness, container):
+    """The queue's normal state is empty, and finding that out must be free:
+    each tick used to open BEGIN IMMEDIATE under the process-wide lock."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    engine = await container.get(AsyncEngine)
+    immediate: list[str] = []
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _record(_conn, _cursor, statement, *_args):
+        if statement.startswith("BEGIN IMMEDIATE"):
+            immediate.append(statement)
+
+    try:
+        assert not await outbox._has_due(engine)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _record)
+
+    assert immediate == [], "an empty peek must not open a write transaction"
+
+
+async def test_retry_after_sets_the_telegram_deadline(harness, session_factory):
+    """429 carries its own deadline: the queue must respect retry_after rather
+    than its exponential backoff. First typed aiogram exception in this suite —
+    every other failure is a RuntimeError, which never exercises this branch."""
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import GetMe
+
+    await onboard(harness)
+    harness.session.fail_on["SendMessage"] = RuntimeError("network down")
+    await harness.send("42", user_id=1)
+    del harness.session.fail_on["SendMessage"]
+    await _make_due(session_factory)
+
+    harness.session.fail_on["SendMessage"] = TelegramRetryAfter(
+        method=GetMe(), message="Too Many Requests: retry after 42", retry_after=42
+    )
+    before = utcnow()
+    sent, carry = await outbox.deliver_batch(harness.bot, session_factory, harness.write_lock)
+    del harness.session.fail_on["SendMessage"]
+
+    assert sent == 0 and carry is None
+    (row,) = await _queued(session_factory)
+    delta = (row.next_attempt_at - before).total_seconds()
+    assert 41 <= delta <= 43, f"the retry deadline must come from retry_after: {delta}"
