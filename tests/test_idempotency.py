@@ -13,6 +13,7 @@ session) and before auth.
 from sqlalchemy import select
 
 from chain_health.db.models import ProcessedUpdate
+from chain_health.services.access import AccessService
 from chain_health.services.rides import RideService
 from tests.bot_harness import make_update_message
 from tests.factories import onboard
@@ -67,20 +68,35 @@ async def test_repeated_update_produces_no_second_reply(harness, container):
     assert len(harness.session.sent_texts()) == replies_after_first
 
 
-async def test_even_a_denied_update_gets_marked(harness, session_factory):
-    """Every update that finishes without raising is marked, including one that
-    auth drops.
+async def test_a_denied_update_is_not_marked(harness, session_factory):
+    """An update auth drops costs neither a row nor the write lock.
 
-    This is a consequence of the unit of work, not an oversight: one request
-    scope is one transaction, and RequestProvider commits it whenever no
-    exception occurred — returning ``None`` from a middleware is not an
-    exception. The mark is therefore written for read-only and denied updates
-    too. Harmless (their redelivery had nothing to repeat) and bounded by the
-    weekly prune, but worth pinning down so the behaviour is not mistaken for
-    a leak later.
+    Marking it was never *wrong* — a denied update's redelivery has nothing to
+    repeat, so skipping the mark is equally safe — but it was not free. The bot
+    is findable by name in Telegram search (D4), so unauthorized traffic is
+    normal, and every such message used to take the process-wide write lock and
+    commit a row. That is the very throughput the send-after-commit work was
+    freeing up, spent on someone the bot does not answer. The mark bought
+    nothing in return: the next spam message carries a new update_id.
     """
     await harness.dp.feed_update(
         harness.bot, make_update_message("hello", user_id=999, update_id=555)
     )
 
-    assert 555 in await _marks(session_factory)
+    assert harness.session.calls == [], "a stranger gets no reply"
+    assert await _marks(session_factory) == [], "and no row written about them"
+
+
+async def test_a_user_allowed_later_is_still_processed(harness, session_factory, container):
+    """Refusal must not swallow the update for good: with no mark, the same
+    update_id goes through normally once access is granted."""
+    update = make_update_message("/menu", user_id=999, update_id=556)
+    await harness.dp.feed_update(harness.bot, update)
+    assert harness.session.calls == []
+
+    async with container() as rc:
+        await (await rc.get(AccessService)).allow_user(999)
+
+    await harness.dp.feed_update(harness.bot, update)
+    assert harness.session.calls, "an allowed user must get an answer"
+    assert 556 in await _marks(session_factory), "now the mark is warranted"

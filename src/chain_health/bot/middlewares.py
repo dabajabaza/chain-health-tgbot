@@ -82,21 +82,30 @@ _MARK_TTL = timedelta(days=7)
 _PRUNE_EVERY = timedelta(hours=1)
 
 
-DELIVERY_SLOT = "delivery_slot"
+UPDATE_SLOT = "update_slot"
 
 
-class _DeliverySlot:
-    """Carries the request scope's Responder back out to the flush.
+class _UpdateSlot:
+    """Scratch space shared by every middleware handling one update.
 
-    A mutable object, not a plain ``data`` key, because aiogram rebuilds the
+    A mutable object, not plain ``data`` keys, because aiogram rebuilds the
     context dict between observers (``propagate_event(..., **kwargs)``): a key
-    written by an inner middleware is invisible to the outer one that has to
-    read it. The slot itself is passed by reference, so both sides see the same
-    object no matter how many times the dict around it is copied.
+    written on the ``message`` chain is invisible on the ``update`` chain that
+    has to read it. The slot itself is passed by reference, so every side sees
+    the same object no matter how many times the dict around it is copied.
+
+    Two things travel in it, in opposite directions:
+
+    * ``responder`` — out of the dishka scope to WriteLockMiddleware, which
+      flushes it once the scope has closed and committed;
+    * ``denied`` — from AuthMiddleware (on the ``message``/``callback_query``
+      chains) back to IdempotencyMiddleware (on ``update``), so a rejected
+      update is not recorded as processed.
     """
 
     def __init__(self) -> None:
         self.responder: Responder | None = None
+        self.denied = False
 
 
 class WriteLockMiddleware(BaseMiddleware):
@@ -141,8 +150,8 @@ class WriteLockMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        slot = _DeliverySlot()
-        data[DELIVERY_SLOT] = slot
+        slot = _UpdateSlot()
+        data[UPDATE_SLOT] = slot
         async with self.lock:
             result = await handler(event, data)
 
@@ -239,7 +248,7 @@ class ResponderMiddleware(BaseMiddleware):
     ) -> Any:
         container: AsyncContainer = data["dishka_container"]
         responder = await container.get(Responder)
-        slot: _DeliverySlot | None = data.get(DELIVERY_SLOT)
+        slot: _UpdateSlot | None = data.get(UPDATE_SLOT)
         if slot is not None:
             slot.responder = responder
 
@@ -277,12 +286,28 @@ class IdempotencyMiddleware(BaseMiddleware):
             logger.warning("Update %s already applied — redelivery dropped", update_id)
             return None
 
+        result = await handler(event, data)
+
+        # Recorded AFTER the handler, and only if the update was actually
+        # handled. The redelivery check above still runs first — a duplicate
+        # must never slip through — but there is nothing to record when nothing
+        # happened.
+        #
+        # An update from a stranger never reaches a handler (AuthMiddleware),
+        # and recording it means one row plus the process-wide write lock for
+        # every spam message. The bot is findable by name in Telegram search
+        # (D4), so a stream of unauthorized updates is normal rather than an
+        # incident — and the mark buys nothing against it, since the next spam
+        # message carries a new update_id anyway.
+        #
         # Added, never committed here. Committing separately would mark the
         # update as done *before* the change happened, and a crash in between
         # would turn the duplicate risk into a loss. RequestProvider commits it
         # together with the business change, or rolls both back on error.
-        session.add(ProcessedUpdate(id=update_id))
-        return await handler(event, data)
+        slot: _UpdateSlot | None = data.get(UPDATE_SLOT)
+        if slot is None or not slot.denied:
+            session.add(ProcessedUpdate(id=update_id))
+        return result
 
 
 class AuthMiddleware(BaseMiddleware):
@@ -325,6 +350,13 @@ class AuthMiddleware(BaseMiddleware):
                 type(event).__name__,
                 invite_attempted,
             )
+            # Tell the unit of work there is nothing to record: the handler
+            # never saw this update, and a processed_updates row would be the
+            # price of somebody else's spam — a write plus the write lock on
+            # every message.
+            slot: _UpdateSlot | None = data.get(UPDATE_SLOT)
+            if slot is not None:
+                slot.denied = True
             return None
 
         # Admins pass `is_allowed` without ever getting a `users` row (they're
