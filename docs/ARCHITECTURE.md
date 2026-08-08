@@ -270,7 +270,12 @@ retries with backoff up to a TTL. At-least-once: a duplicated *reply* is
 harmless, a lost one is not, because the user re-enters the ride and it gets
 logged twice.
 
-Not everything is queued. Telegram accepts an answer to a callback query for
+Not everything is queued. **Edits are not**: an edit is the state of one
+particular screen rather than a fact, and replayed a minute later it overwrites
+wherever the user has navigated since — a failed ride-list edit would drop the
+stale card on top of whatever they are looking at now. The queue carries
+messages, not screens; an undelivered edit is simply not retried, and the next
+screen shows the truth. Telegram accepts an answer to a callback query for
 seconds only; clearing a spent keyboard is cosmetic; and the **pinned status
 message** stays best-effort as before — `Responder._sync_pinned` swallows
 `TelegramAPIError` and logs, and stores the recreated message's id *before*
@@ -289,10 +294,18 @@ pinned as a property rather than a stopwatch:
 `tests/test_concurrency.py::test_the_database_is_free_while_talking_to_telegram`
 asks the database itself whether it is writable during every Telegram call.
 
-The price is a second, very short transaction after delivery, for the two facts
-that only exist afterwards: which outbox rows went out, and the id of a
-recreated pinned message. Losing it is harmless both ways — an undeleted row
-means one duplicate reply, a lost pinned id means one extra pinned message.
+A row is also held back for a grace period before the background sender may
+touch it. Without that, a poll tick landing inside the normal send window
+delivered the same reply twice in ordinary operation, not just after a crash.
+
+The price is a second, very short transaction after delivery. It carries the
+facts that only exist afterwards — which outbox rows went out, the id of a
+recreated pinned message — and the hourly processed_updates sweep, which used
+to share the update's own transaction until it became clear a maintenance
+DELETE could roll a recorded ride back with it. Losing this transaction is
+harmless both ways (an undeleted row means one duplicate reply, a lost pinned
+id one extra pinned message), and its failure is logged rather than raised:
+raised, it would tell the user "try again" about a ride that was recorded.
 
 The residual hazard from the old ordering is gone in one direction and unchanged
 in the other: a *commit* failure still surfaces from the request scope's
