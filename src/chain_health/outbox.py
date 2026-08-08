@@ -17,7 +17,7 @@ from datetime import timedelta
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.methods import EditMessageText, SendMessage, TelegramMethod
+from aiogram.methods import SendMessage, TelegramMethod
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,9 +41,11 @@ TTL = timedelta(days=1)
 # Only what we put there ourselves is revived (see db.models.OutboxMessage).
 # An explicit map rather than a lookup by name: the row comes out of the
 # database and must not be able to name an arbitrary Bot API method.
+#
+# Edits are absent on purpose (see ui.Responder.edit): a deferred edit returns
+# the user to a screen they have already left.
 _METHODS: dict[str, type[TelegramMethod]] = {
     SendMessage.__name__: SendMessage,
-    EditMessageText.__name__: EditMessageText,
 }
 
 

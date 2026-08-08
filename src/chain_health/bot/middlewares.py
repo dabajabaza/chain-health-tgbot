@@ -76,6 +76,12 @@ class PrivateChatOnlyMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+# Telegram keeps unconfirmed updates for a day, so a week of marks is ample and
+# keeps the table from growing without bound.
+_MARK_TTL = timedelta(days=7)
+_PRUNE_EVERY = timedelta(hours=1)
+
+
 DELIVERY_SLOT = "delivery_slot"
 
 
@@ -127,6 +133,7 @@ class WriteLockMiddleware(BaseMiddleware):
         # transaction below opens its own session, after the update's scope has
         # already closed.
         self._container = container
+        self._pruned_at = utcnow() - _PRUNE_EVERY
 
     async def __call__(
         self,
@@ -149,7 +156,17 @@ class WriteLockMiddleware(BaseMiddleware):
             try:
                 await responder.flush()
             finally:
-                await self._settle(responder)
+                # The change is committed and the reply is out. A failure of
+                # this post-send bookkeeping must not reach dp.errors and tell
+                # the user "try again" about an operation that succeeded —
+                # they would re-enter the ride and it would be logged twice.
+                # Everything losable here is losable harmlessly: an undeleted
+                # outbox row is one duplicate reply, a lost pinned id is one
+                # extra pinned message.
+                try:
+                    await self._settle(responder)
+                except Exception:
+                    logger.exception("Post-send bookkeeping failed; the update itself is applied")
         return result
 
     async def _settle(self, responder: Responder) -> None:
@@ -162,14 +179,23 @@ class WriteLockMiddleware(BaseMiddleware):
         * delivered outbox rows are dropped (whatever is left, outbox.py keeps
           retrying);
         * the id of a pinned status message that had to be recreated is stored,
-          because that id does not exist until the message has been sent.
+          because that id does not exist until the message has been sent;
+        * once an hour, expired processed_updates marks are swept.
+
+        The sweep lives HERE rather than inside the update's own transaction.
+        Sharing it meant a maintenance DELETE could roll a ride back with it:
+        the user saw "try again" because of housekeeping, and their ride was
+        silently not recorded. Housekeeping has no business failing a business
+        operation, and separate transactions are the only way to guarantee that.
 
         Losing this transaction is harmless either way: an undeleted outbox row
         means one duplicate reply, and a lost pinned id means the next sync
         creates another pinned message.
         """
+        now = utcnow()
         delivered = responder.delivered()
-        if not delivered and not responder.pinned_updates:
+        prune = now - self._pruned_at >= _PRUNE_EVERY
+        if not delivered and not responder.pinned_updates and not prune:
             return
         factory = await self._container.get(async_sessionmaker[AsyncSession])
         async with self.lock, factory() as session:
@@ -178,7 +204,16 @@ class WriteLockMiddleware(BaseMiddleware):
             users = UserService(session)
             for user_id, message_id in responder.pinned_updates:
                 await users.set_pinned_message_id(user_id, message_id)
+            if prune:
+                await session.execute(
+                    delete(ProcessedUpdate).where(ProcessedUpdate.created_at < now - _MARK_TTL)
+                )
             await session.commit()
+        # Advanced only after a successful commit: otherwise a failed sweep
+        # would postpone the next one by another hour and the table would grow
+        # quietly.
+        if prune:
+            self._pruned_at = now
         delivered.clear()
         responder.pinned_updates.clear()
 
@@ -213,12 +248,6 @@ class ResponderMiddleware(BaseMiddleware):
         return result
 
 
-# Telegram keeps unconfirmed updates for a day, so a week of marks is ample and
-# keeps the table from growing without bound.
-_MARK_TTL = timedelta(days=7)
-_PRUNE_EVERY = timedelta(hours=1)
-
-
 class IdempotencyMiddleware(BaseMiddleware):
     """Drops an update that has already been applied.
 
@@ -230,18 +259,6 @@ class IdempotencyMiddleware(BaseMiddleware):
     session already exists, and *before* the auth middleware so a redelivery
     never reaches ``ensure_registered`` either.
     """
-
-    def __init__(self) -> None:
-        self._pruned_at = utcnow() - _PRUNE_EVERY
-
-    async def _prune(self, session: AsyncSession) -> None:
-        now = utcnow()
-        if now - self._pruned_at < _PRUNE_EVERY:
-            return
-        self._pruned_at = now
-        await session.execute(
-            delete(ProcessedUpdate).where(ProcessedUpdate.created_at < now - _MARK_TTL)
-        )
 
     async def __call__(
         self,
@@ -265,14 +282,7 @@ class IdempotencyMiddleware(BaseMiddleware):
         # would turn the duplicate risk into a loss. RequestProvider commits it
         # together with the business change, or rolls both back on error.
         session.add(ProcessedUpdate(id=update_id))
-        result = await handler(event, data)
-        # Pruned only after the handler, never before it. A DELETE issued up
-        # front takes SQLite's write lock for the whole request scope, and any
-        # other session that needs to write during handling then dies with
-        # "database is locked". Here the write lands right before the scope
-        # commits, so the lock is held about as briefly as it always was.
-        await self._prune(session)
-        return result
+        return await handler(event, data)
 
 
 class AuthMiddleware(BaseMiddleware):

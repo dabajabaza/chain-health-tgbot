@@ -1,5 +1,6 @@
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from dishka import FromDishka
 
@@ -11,13 +12,29 @@ from chain_health.services.access import AccessService
 router = Router(name="admin")
 
 
+async def _stop_dialog(state: FSMContext) -> None:
+    """An admin command interrupts an open dialog, the way /menu does.
+
+    The admin router is included first, so its handlers take the update whole
+    and propagation stops before any fsm_* handler — meaning the state is never
+    cleared. A user who taps "add a chain", then types /invite instead of the
+    name, leaves AddChain.name live: their next unrelated message is silently
+    swallowed as a chain name.
+    """
+    await state.clear()
+
+
 @router.message(Command("invite"))
 async def cmd_invite(
-    message: Message, access: FromDishka[AccessService], responder: FromDishka[Responder]
+    message: Message,
+    state: FSMContext,
+    access: FromDishka[AccessService],
+    responder: FromDishka[Responder],
 ) -> None:
     user_id = message_user_id(message)
     if not access.is_admin(user_id):
         return
+    await _stop_dialog(state)
     invite = await access.create_invite(user_id)
     assert message.bot is not None
     # me(), not get_me(): aiogram caches the result and __main__ warms it at
@@ -31,11 +48,13 @@ async def cmd_invite(
 async def cmd_allow(
     message: Message,
     command: CommandObject,
+    state: FSMContext,
     access: FromDishka[AccessService],
     responder: FromDishka[Responder],
 ) -> None:
     if not access.is_admin(message_user_id(message)):
         return
+    await _stop_dialog(state)
     args = (command.args or "").strip()
     # isdecimal(), not isdigit(): isdigit() is true for characters like the
     # superscript "³" that int() then rejects with ValueError.
