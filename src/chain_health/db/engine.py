@@ -16,6 +16,11 @@ from sqlalchemy.ext.asyncio import (
 # readers proceed without blocking on a writer.
 _BUSY_TIMEOUT_MS = 10_000
 
+# Marks a connection as known-read-only: its transaction opens as DEFERRED and
+# never touches the write lock (WAL readers do not block writers). Set via
+# execution_options; the outbox poller's peek is the consumer.
+READONLY = "chain_health_readonly"
+
 
 def create_engine(database_url: str) -> AsyncEngine:
     engine = create_async_engine(database_url)
@@ -49,6 +54,12 @@ def create_engine(database_url: str) -> AsyncEngine:
         # BEGIN, SQLAlchemy has to open the transaction itself, at the point
         # it considers a transaction to have started.
         #
+        if conn.get_execution_options().get(READONLY):
+            # A known-read-only connection gets DEFERRED on purpose: IMMEDIATE
+            # would take the write lock for a bare SELECT, which is exactly
+            # what the empty-queue poll must not cost.
+            conn.exec_driver_sql("BEGIN")
+            return
         # IMMEDIATE, not a plain (deferred) BEGIN. A deferred transaction
         # takes its read snapshot at the first SELECT and only asks for the
         # write lock later, and SQLite refuses that upgrade outright — with

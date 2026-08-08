@@ -13,14 +13,16 @@ not, because the user repeats the entry and the ride is logged twice.
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage, TelegramMethod
 from sqlalchemy import delete, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from chain_health.db.engine import READONLY
 from chain_health.db.models import OutboxMessage
 from chain_health.timeutils import utcnow
 
@@ -67,18 +69,72 @@ def _revive(row_id: int, method: str, payload: str) -> TelegramMethod | None:
         return None
 
 
+@dataclass(slots=True)
+class _Outcome:
+    """The fate of a sent batch that has not been written to the DB yet.
+
+    Until it is written, sending more is FORBIDDEN: rows in ``done`` are
+    delivered but still queued, and the next pass would send them again — once
+    per tick until the database becomes writable. At-least-once would degrade
+    into an unbounded duplicate loop.
+    """
+
+    done: list[int] = field(default_factory=list)
+    retry: list[tuple[int, int, object]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.done or self.retry)
+
+
+async def _has_due(engine: AsyncEngine) -> bool:
+    """Any rows due — WITHOUT the lock and without a write transaction.
+
+    An empty poll tick used to cost BEGIN IMMEDIATE under the process-wide
+    lock, ~17k write transactions a day for a normally-empty table; while an
+    outside writer held the file, every tick also stalled user updates for
+    busy_timeout. A READONLY read under WAL touches no write lock at all.
+    """
+    async with engine.connect() as conn:
+        ro = await conn.execution_options(**{READONLY: True})
+        found = await ro.scalar(
+            select(OutboxMessage.id).where(OutboxMessage.next_attempt_at <= utcnow()).limit(1)
+        )
+    return found is not None
+
+
+async def _apply_outcome(
+    session_factory: async_sessionmaker[AsyncSession], lock: asyncio.Lock, outcome: _Outcome
+) -> None:
+    """Write the batch's fate: delete the delivered, back off the failed."""
+    async with lock, session_factory() as session:
+        if outcome.done:
+            await session.execute(delete(OutboxMessage).where(OutboxMessage.id.in_(outcome.done)))
+        # One UPDATE per group rather than one SELECT+UPDATE per row: the rows
+        # were already read at selection time, and up to BATCH extra round
+        # trips would hold the process-wide lock exactly when the queue is full
+        # after an outage.
+        for (when, attempts), ids in _grouped(outcome.retry).items():
+            await session.execute(
+                update(OutboxMessage)
+                .where(OutboxMessage.id.in_(ids))
+                .values(next_attempt_at=when, attempts=attempts)
+            )
+        await session.commit()
+
+
 async def deliver_batch(
     bot: Bot, session_factory: async_sessionmaker[AsyncSession], lock: asyncio.Lock
-) -> int:
-    """One pass over the queue. Returns how many messages went out.
+) -> tuple[int, _Outcome | None]:
+    """One pass over the queue: (messages sent, unwritten outcome).
+
+    Outcome None means everything is recorded; otherwise the caller MUST write
+    it before sending anything else (see _Outcome) — run_sender does exactly
+    that, and tests see the failure explicitly instead of a swallowed log line.
 
     Three steps, and the split is not cosmetic: read under the lock, send
     WITHOUT it, write the outcome back under the lock. Sending under the lock
     would make this task reproduce the very defect the whole design removes,
     holding the database for a full round trip to Telegram.
-
-    A function rather than the loop body so tests can call it directly, without
-    starting a task and fighting the clock.
     """
     now = utcnow()
     async with lock, session_factory() as session:
@@ -94,10 +150,11 @@ async def deliver_batch(
         # network call, and touching a detached row afterwards would fail.
         pending = [(r.id, r.method, r.payload, r.created_at, r.attempts) for r in rows]
     if not pending:
-        return 0
+        return 0, None
 
-    done: list[int] = []  # delivered or hopeless — deleted either way
-    retry: list[tuple[int, int, object]] = []  # id, attempt, when to try again
+    outcome = _Outcome()
+    done = outcome.done  # delivered or hopeless — deleted either way
+    retry = outcome.retry  # id, attempt, when to try again
     sent = 0
     for row_id, method_name, payload, created_at, attempts in pending:
         if utcnow() - created_at > TTL:
@@ -122,21 +179,12 @@ async def deliver_batch(
             sent += 1
             logger.info("Deferred delivery of %s (%s) succeeded", row_id, method_name)
 
-    async with lock, session_factory() as session:
-        if done:
-            await session.execute(delete(OutboxMessage).where(OutboxMessage.id.in_(done)))
-        # One UPDATE per group rather than one SELECT+UPDATE per row: the rows
-        # were already read a few lines above, and up to BATCH extra round
-        # trips would hold the process-wide lock exactly when the queue is full
-        # after an outage.
-        for (when, attempts), ids in _grouped(retry).items():
-            await session.execute(
-                update(OutboxMessage)
-                .where(OutboxMessage.id.in_(ids))
-                .values(next_attempt_at=when, attempts=attempts)
-            )
-        await session.commit()
-    return sent
+    try:
+        await _apply_outcome(session_factory, lock, outcome)
+    except Exception:
+        logger.exception("Batch outcome not recorded — sending paused until it is")
+        return sent, outcome
+    return sent, None
 
 
 def _grouped(retry: list[tuple[int, int, object]]) -> dict[tuple[object, int], list[int]]:
@@ -165,6 +213,7 @@ async def purge_expired(
 async def run_sender(
     bot: Bot,
     session_factory: async_sessionmaker[AsyncSession],
+    engine: AsyncEngine,
     lock: asyncio.Lock,
     *,
     interval: float = POLL_INTERVAL,
@@ -175,15 +224,28 @@ async def run_sender(
     per process, and a background task is no exception.
     """
     purged_at = utcnow() - PURGE_EVERY
+    carry: _Outcome | None = None
     while True:
         try:
+            if carry:
+                # Record the fate of the batch that ALREADY went out before
+                # sending anything new: its delivered rows still look queued,
+                # and another pass would deliver them again — once per tick
+                # until the database comes back.
+                await _apply_outcome(session_factory, lock, carry)
+                carry = None
             if utcnow() - purged_at >= PURGE_EVERY:
                 await purge_expired(session_factory, lock)
                 purged_at = utcnow()
-            await deliver_batch(bot, session_factory, lock)
+            # An empty queue is the normal state, and finding that out must be
+            # free: READONLY read, no lock — see _has_due.
+            if await _has_due(engine):
+                _sent, carry = await deliver_batch(bot, session_factory, lock)
         except asyncio.CancelledError:
             raise
         except Exception:
             # Staying alive matters more: the queue gets another pass shortly.
+            # carry survives — if the write itself failed, the next pass
+            # starts with it.
             logger.exception("Outbox sender failed")
         await asyncio.sleep(interval)

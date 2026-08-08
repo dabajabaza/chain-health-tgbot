@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -126,6 +127,9 @@ class BotHarness:
     bot: Bot
     dp: Dispatcher
     session: RecordingSession
+    # The write lock the dispatcher was built with: outbox tests must use the
+    # same one — a fresh Lock() would be a second writer.
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _next_update_id: int = field(default=1)
 
     def _update_id(self) -> int:
