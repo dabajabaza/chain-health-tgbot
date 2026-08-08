@@ -10,6 +10,9 @@ from chain_health.config import Settings
 from chain_health.db.base import Base
 from chain_health.db.models import *  # noqa: F401,F403  (registers models on Base.metadata)
 
+# Placeholder value shipped in alembic.ini: means "no URL configured".
+_ALEMBIC_INI_PLACEHOLDER = "driver://user:pass@localhost/dbname"
+
 config = context.config
 target_metadata = Base.metadata
 
@@ -86,7 +89,12 @@ else:
         # logger would go silent for the rest of the process, taking the access
         # denials, delivery failures and watchdog warnings with them.
         fileConfig(config.config_file_name, disable_existing_loggers=False)
-    config.set_main_option("sqlalchemy.url", Settings().database_url)
+    # Only when the caller has not set one. An unconditional override points
+    # every hand-run alembic invocation at the live database: an operator who
+    # copies the file and runs `downgrade -1` against the copy drops tables in
+    # production instead.
+    if config.get_main_option("sqlalchemy.url") in (None, "", _ALEMBIC_INI_PLACEHOLDER):
+        config.set_main_option("sqlalchemy.url", Settings().database_url)
     if context.is_offline_mode():
         run_migrations_offline()
     else:

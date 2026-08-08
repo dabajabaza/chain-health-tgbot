@@ -18,7 +18,7 @@ from datetime import timedelta
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage, TelegramMethod
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from chain_health.db.models import OutboxMessage
@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL = 5.0
 # Rows per pass, so a long queue does not hold the write lock in one go.
 BATCH = 20
+# How often to sweep expired rows. Not on every tick: that is a write under the
+# process-wide lock, and the table is normally empty.
+PURGE_EVERY = timedelta(hours=1)
 # Retry spacing: a minute, two, four… capped at an hour.
 BACKOFF_BASE = timedelta(seconds=30)
 BACKOFF_MAX = timedelta(hours=1)
@@ -122,13 +125,26 @@ async def deliver_batch(
     async with lock, session_factory() as session:
         if done:
             await session.execute(delete(OutboxMessage).where(OutboxMessage.id.in_(done)))
-        for row_id, attempts, when in retry:
-            row = await session.get(OutboxMessage, row_id)
-            if row is not None:
-                row.attempts = attempts
-                row.next_attempt_at = when  # type: ignore[assignment]
+        # One UPDATE per group rather than one SELECT+UPDATE per row: the rows
+        # were already read a few lines above, and up to BATCH extra round
+        # trips would hold the process-wide lock exactly when the queue is full
+        # after an outage.
+        for (when, attempts), ids in _grouped(retry).items():
+            await session.execute(
+                update(OutboxMessage)
+                .where(OutboxMessage.id.in_(ids))
+                .values(next_attempt_at=when, attempts=attempts)
+            )
         await session.commit()
     return sent
+
+
+def _grouped(retry: list[tuple[int, int, object]]) -> dict[tuple[object, int], list[int]]:
+    """Rows sharing a retry time and attempt count — usually one or two groups."""
+    groups: dict[tuple[object, int], list[int]] = {}
+    for row_id, attempts, when in retry:
+        groups.setdefault((when, attempts), []).append(row_id)
+    return groups
 
 
 async def purge_expired(
@@ -158,9 +174,12 @@ async def run_sender(
     ``lock`` is the same write lock the middleware takes: SQLite has one writer
     per process, and a background task is no exception.
     """
+    purged_at = utcnow() - PURGE_EVERY
     while True:
         try:
-            await purge_expired(session_factory, lock)
+            if utcnow() - purged_at >= PURGE_EVERY:
+                await purge_expired(session_factory, lock)
+                purged_at = utcnow()
             await deliver_batch(bot, session_factory, lock)
         except asyncio.CancelledError:
             raise

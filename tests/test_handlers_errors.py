@@ -2,7 +2,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import GetMe
 
-from chain_health.bot.callbacks import ChainAction, ChainCB, GroupAction, GroupCB
+from chain_health.bot import texts as bot_texts
+from chain_health.bot.callbacks import ChainAction, ChainCB, GroupAction, GroupCB, RideAction
 from chain_health.bot.states import EditRideAmount
 from chain_health.services.access import AccessService
 from chain_health.services.garage import GarageService
@@ -107,3 +108,20 @@ async def test_editing_a_ride_amount_with_a_foreign_ride_id_in_state_is_denied(h
         rides = await rc.get(RideService)
         untouched = await rides.require_ride(1, ride_id)
         assert untouched.distance_km == 42
+
+
+async def test_a_forged_out_of_range_id_gets_the_stale_button_answer(harness):
+    """Ids in callback_data are client-forgeable and land in a SQLite bind
+    parameter. Python ints are unbounded, so a 23-digit value — comfortably
+    inside Telegram's 64-byte limit — used to pass validation and raise
+    OverflowError deep inside the query: the user saw the generic failure toast
+    and the journal got a traceback, instead of the stale-button answer.
+    """
+    await onboard(harness)
+    harness.session.clear()
+
+    await harness.click(f"ride:{RideAction.DELETE.value}:{'9' * 23}", user_id=1)
+
+    answers = [m.text or "" for m in harness.session.calls_of("AnswerCallbackQuery")]
+    assert answers, "the spinner must stop"
+    assert bot_texts.ERR_UNEXPECTED not in answers, f"expected a graceful answer, got {answers}"
