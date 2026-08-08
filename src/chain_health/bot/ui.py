@@ -19,6 +19,7 @@ recorded intent consistent with the data that was committed.
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Literal
 
 from aiogram import Bot
@@ -47,10 +48,15 @@ from chain_health.db.models import OutboxMessage
 from chain_health.domain.errors import StaleMessageError
 from chain_health.services.status import StatusService
 from chain_health.services.users import UserService
+from chain_health.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
 _BENIGN_EDIT_ERRORS = ("message is not modified",)
+
+# How long an outbox row belongs to the normal send before the background
+# sender may touch it. Comfortably longer than a round trip plus a poll tick.
+OUTBOX_GRACE = timedelta(minutes=1)
 
 
 def _dump(method: TelegramMethod[Any]) -> str:
@@ -236,7 +242,18 @@ class Responder:
         text: str,
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
-        """Edit an inline message, treating "not modified" as success."""
+        """Edit an inline message, treating "not modified" as success.
+
+        NOT durable, unlike a send. An edit is the state of one particular
+        screen, not a fact; replayed a minute later it overwrites wherever the
+        user has navigated since. The scenario is not hypothetical: a ride
+        deletion fails to deliver, the user goes back to the list, and the
+        queued edit then puts the stale ride card back on top of it.
+
+        The price is that an undelivered card edit is not retried. The
+        operation is applied either way and the next screen shows the truth —
+        cheaper than teleporting the user into the past.
+        """
         editable = require_editable(message)
         self._queue.append(
             _Call(
@@ -247,7 +264,6 @@ class Responder:
                     reply_markup=reply_markup,
                 ),
                 on_error="not_modified",
-                durable=True,
             )
         )
 
@@ -287,8 +303,22 @@ class Responder:
         operation with nobody told about it — which is precisely what reordering
         send and commit must not cost.
         """
+        # next_attempt_at is offset: the normal send happens right after the
+        # commit and takes a Telegram round trip. A row visible to the sender
+        # immediately would be picked up by a poll tick landing inside that
+        # window, and the user would get the same reply twice in ordinary
+        # operation rather than after a crash. The sender must only ever see
+        # what the normal path is no longer going to delete.
+        due = utcnow() + OUTBOX_GRACE
         rows = [
-            (item, OutboxMessage(method=type(item.method).__name__, payload=_dump(item.method)))
+            (
+                item,
+                OutboxMessage(
+                    method=type(item.method).__name__,
+                    payload=_dump(item.method),
+                    next_attempt_at=due,
+                ),
+            )
             for item in self._queue
             if isinstance(item, _Call) and item.durable
         ]

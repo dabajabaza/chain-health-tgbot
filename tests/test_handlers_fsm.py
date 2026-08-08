@@ -69,3 +69,16 @@ async def test_restarting_start_as_a_returning_user_clears_a_stuck_dialog(harnes
     await harness.send("/start", user_id=1)
 
     assert await fsm_state(harness) is None
+
+
+async def test_an_admin_command_interrupts_an_open_dialog(harness, session_factory):
+    """The admin router is included first and takes the update whole, so it has
+    to clear the state itself — otherwise the user's next message is swallowed
+    as the answer to a dialog they abandoned."""
+    await onboard(harness)
+    await harness.click(GroupCB(action=GroupAction.ADD).pack(), user_id=1)
+    assert await fsm_state(harness) is not None, "the dialog must be open"
+
+    await harness.send("/invite", user_id=1)
+
+    assert await fsm_state(harness) is None, "an admin command must close the dialog"

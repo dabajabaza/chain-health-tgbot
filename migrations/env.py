@@ -80,7 +80,12 @@ if injected_connection is not None:
     do_run_migrations(injected_connection)
 else:
     if config.config_file_name is not None:
-        fileConfig(config.config_file_name)
+        # disable_existing_loggers=False is required: by default fileConfig
+        # permanently disables every logger created so far, and migrations run
+        # inside the bot process at startup — every chain_health.* and aiogram
+        # logger would go silent for the rest of the process, taking the access
+        # denials, delivery failures and watchdog warnings with them.
+        fileConfig(config.config_file_name, disable_existing_loggers=False)
     config.set_main_option("sqlalchemy.url", Settings().database_url)
     if context.is_offline_mode():
         run_migrations_offline()
