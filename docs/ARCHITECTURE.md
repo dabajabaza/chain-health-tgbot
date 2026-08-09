@@ -73,8 +73,9 @@ and outer-middleware chains run in registration order too.
 
 **Decision:** `chain_health.__main__.build_dispatcher` fixes one order:
 `PrivateChatOnlyMiddleware` (before `setup_dishka`, so no dishka scope opens
-for group traffic) → routers (`admin, start, status, menu, rotation, rides,
-mileage, fallback`) → `dp.errors.register` → `setup_dishka` → `AuthMiddleware`.
+for group traffic) → routers (`admin, start, status, menu, groups, chains,
+rotation, rides, mileage, fallback`) → `dp.errors.register` → `setup_dishka` →
+`AuthMiddleware`.
 Only one thing actually depends on this order: `fallback.router` must be
 **last** — its `@router.callback_query()` has no filter at all and catches
 anything nothing else matched. (`mileage.router`'s loose numeric regex
@@ -82,10 +83,19 @@ anything nothing else matched. (`mileage.router`'s loose numeric regex
 typed mid-dialog never reaches it regardless of registration order — the
 state filter alone rules it out, not position in the list.)
 
+`groups` and `chains` were split out of `menu` by subject (D22) and sit next
+to it because they are the same menu tree, not because the position is
+load-bearing: the parenthetical above covers them too, and their `fsm_*`
+handlers beat `mileage` on the state filter rather than on being earlier.
+
 **Consequences:** Adding a new router means picking a position, not just
-appending — specifically, before `fallback`. `build_dispatcher` is the single
-place production and the test harness both call, so the two can never
-diverge (see D16).
+appending — specifically, before `fallback`. It also means adding it to
+**two** lists: `build_dispatcher` and `conftest.py::_SHARED_ROUTERS`, which
+detaches `_parent_router` between tests. A router present in the first but
+missing from the second keeps a parent from the previous test's dispatcher,
+and the failure then surfaces somewhere other than the mistake.
+`build_dispatcher` is the single place production and the test harness both
+call, so the two can never diverge (see D16).
 
 **Revisit when:** the routing surface grows enough that "must come last"
 constraints multiply past what a linear list can express clearly.
@@ -145,7 +155,7 @@ the placeholder/pinned sync — a deliberate small duplication rather than
 threading a precomputed view through, because the two call sites shouldn't
 have to agree on shape. `ReminderService.due_user_ids` similarly builds a
 full `DueReminder` (with its `ChainStatus`) just to project out the user id,
-and `scheduler.py`'s phase 2 recomputes the same status per user again in a
+and `runtime/scheduler.py`'s phase 2 recomputes the same status per user again in a
 fresh scope — that one is *not* the same trade-off as the two above (see the
 comment on `due_user_ids`): it exists because phase 2 must re-verify against
 current data in its own transaction, not because reuse was deemed not worth
@@ -265,7 +275,7 @@ scope has closed — transaction committed, write lock released.
 The gap this opens (an applied change nobody was told about) is closed by a
 queue, not by ordering. The promise to reply is written into the `outbox` table
 in the same transaction as the change; delivery right after the commit deletes
-the row; a failure leaves it for the background sender (`outbox.py`), which
+the row; a failure leaves it for the background sender (`runtime/outbox.py`), which
 retries with backoff up to a TTL. At-least-once: a duplicated *reply* is
 harmless, a lost one is not, because the user re-enters the ride and it gets
 logged twice.
@@ -421,7 +431,7 @@ adapter code.
   `Settings` directly and calls `timeutils.utcnow()` — a full clock
   abstraction is the textbook answer for testability, but tests here just
   call the real (fast, deterministic-enough) functions; not worth the
-  indirection for a single-timezone personal bot. `scheduler.py`'s timing
+  indirection for a single-timezone personal bot. `runtime/scheduler.py`'s timing
   functions do the same — no `Protocol`, no injectable "now" parameter; tests
   monkeypatch `chain_health.timeutils.utcnow` (the one clock read every
   timing function goes through via `timeutils.local_now`) rather than the
@@ -446,7 +456,7 @@ trying both. Every mutating operation then takes the **entity**, not a bare
 id (`rotate(chain: Chain)`, `set_chain_limit(chain: Chain, ...)`, ...) — a
 handler that skips `require_chain` has no id to pass in the first place, so
 the type signature itself makes the unsafe path harder to reach than the
-safe one. `menu.py`'s `_group_detail_view`/`_chain_detail_view` are the sole
+safe one. `handlers/_views.py`'s `group_detail_view`/`chain_detail_view` are the sole
 authorization point for the detail screens; FSM handlers that resume with a
 stored id (see D5) re-run the resolver at the point they use it rather than
 trusting what's in state, since the state was itself populated from a
@@ -477,19 +487,25 @@ handlers/middleware through the real `Dispatcher`, not a reimplementation of
 the routing.
 
 **Decision:**
-- `tests/schema.py::apply_migrations` runs the real Alembic chain against a
+- `tests/helpers/schema.py::apply_migrations` runs the real Alembic chain against a
   sync SQLite engine once per test session (`conftest.py::migrated_template`);
   each test gets a private `shutil.copyfile` of that template
   (`conftest.py::db_path`) rather than re-running migrations per test or
   falling back to `Base.metadata.create_all`, which is exactly the drift
-  `test_schema.py::test_metadata_matches_migrations` (`compare_metadata`) is
+  `test_schema.py::test_migrated_schema_matches_the_orm_models` (`compare_metadata`) is
   there to catch.
-- `tests/bot_harness.py::BotHarness` drives `chain_health.__main__
+- `tests/helpers/bot_harness.py::BotHarness` drives `chain_health.__main__
   .build_dispatcher` — the *same* function production calls — through
   fabricated `Update`s, with `RecordingSession(BaseSession)` standing in for
   the network. This is what makes D3's ordering claims checkable at all:
   production and the test harness share one dispatcher-construction path,
   so they cannot drift apart.
+- Test machinery lives in `tests/helpers/` (`bot_harness`, `factories`,
+  `schema`); `tests/conftest.py` stays at the top of `tests/`, because pytest
+  auto-loads a conftest only along the rootdir → test-file chain, so one
+  inside `helpers/` would silently apply to nothing. The point is not tidiness:
+  the `tests.helpers.` prefix makes every import site say whether a test is
+  pulling in machinery or reaching into another test module.
 - aiogram's `Router` can only ever attach to one parent `Dispatcher` for its
   lifetime, but the handler modules' routers are module-level singletons (as
   they must be in production — a real process builds its dispatcher exactly
@@ -507,12 +523,12 @@ second bot instance/process needs to share the router singletons safely.
 
 ## D17 — Scheduler stays a pure timing module
 
-**Context:** `scheduler.py` decides *when* to run a reminder pass; it must
+**Context:** `runtime/scheduler.py` decides *when* to run a reminder pass; it must
 never decide *what* a reminder says or *how* it's delivered, or the
 scheduler/presentation coupling this codebase deliberately removed (see the
 architectural remediation this doc's D1–D14 came out of) creeps back in.
 
-**Decision:** `scheduler.py` imports neither `bot.texts` nor anything from
+**Decision:** `runtime/scheduler.py` imports neither `bot.texts` nor anything from
 `bot/` — `ReminderService`/`ReminderNotifier` (see D4, D8) own the "what" and
 "how". `test_scheduler.py::test_scheduler_module_does_not_import_the
 _presentation_layer` is a fitness test asserting `"texts"`/`"Responder"` are
@@ -522,7 +538,7 @@ reaches back into the presentation layer from here.
 **Consequences:** Cheap to keep once established; the fitness test is the
 guard against silent regrowth of the coupling, not code review alone.
 
-**Revisit when:** never — if scheduler.py ever needs bot/texts, that's a sign
+**Revisit when:** never — if runtime/scheduler.py ever needs bot/texts, that's a sign
 the decoupling itself needs revisiting, not just this test.
 
 ## D18 — Resource-based wear warning (`resource_km`)
@@ -689,6 +705,78 @@ operation needs the same treatment, not a read-then-write.
 **Revisit when:** a new mutating flow needs "exactly once under concurrent
 callers" semantics — check whether it's an insert-or-get or a claim, and
 reuse the matching pattern above rather than inventing a third one.
+
+## D22 — Package layout: four root modules, five layers, and `runtime/`
+
+**Context:** `bot/ db/ domain/ services/` were already proper layers, but the
+package root had accumulated six loose modules next to `__main__.py` —
+`config`, `di`, `outbox`, `scheduler`, `timeutils`, `watchdog` — with no rule
+telling them apart. A flat list does not answer the only question someone
+adding a file asks: where does this go? And D13's stage-2 mileage poller will
+be a fourth background loop, i.e. more of the same.
+
+The obvious fix — sweep the leftovers into a `core/`-style package — is worse
+than the problem. `timeutils` is imported by `db/models.py` while `outbox`
+imports `timeutils`; `config` is imported by `services/` while `scheduler`
+imports `services/`. Either grouping turns an acyclic *module* graph into a
+cyclic *package* graph, and falsifies the one-sentence layer rule D12 and D17
+lean on. A package named for a vague noun also has no admission criterion, so
+it becomes the next dumping ground by construction.
+
+**Decision:** One new package, `runtime/`, with a checkable admission rule:
+
+> a module belongs in `runtime/` iff `__main__.py` is its only importer in
+> `src/`, **and** `__main__` is what starts it.
+
+That admits exactly `outbox.py` (the retry pump, D10), `scheduler.py` (the
+reminder loop, D17/D19) and `watchdog.py` (liveness to the supervisor), and
+nothing else. Everything remaining at the root has one job each:
+
+- `__main__.py` — the process entrypoint; the only module that starts anything.
+  Cannot move: `PROJECT_ROOT` is derived from its depth, and `python -m
+  chain_health` requires it at the package root.
+- `di.py` — the composition root; the only module that knows every layer.
+- `config.py` — settings; any layer may read it, it imports no layer. Also read
+  by `migrations/env.py`, which is why leaving it here keeps `migrations/`
+  out of the blast radius of any future reshuffle.
+- `timeutils.py` — the one clock (D9, D14); imports nothing, sits below every
+  layer. Not in `domain/`, which would make `db -> domain` and contradict D12;
+  not in `runtime/`, which would make `db -> runtime -> db`.
+
+Within the layers, the same pass split the three files that had outgrown a
+single subject — `bot/handlers/menu.py` into `menu`/`groups`/`chains` plus a
+shared `_views.py`, and `bot/ui.py` into `ui` (the `Responder`), `dialogs`,
+`_telegram` and `_outgoing` — and moved two constants to where they are true:
+the Telegram API limits from `domain/constants.py` to `bot/limits.py`, and the
+SQLite id bound from `bot/callbacks.py` to `db/limits.py`.
+
+The boundary for all of it was **whole top-level symbols** — a module, class,
+function or constant moves; class internals are not touched. That is why
+`Responder` survived intact at 280-odd lines: taking it apart is a different
+kind of change, and mixing the two would make the diff unreviewable.
+
+**Consequences:** `ls src/chain_health/` answers "where does this go" without
+a debate, and the stage-2 poller has an obvious home. The layer rules are
+greppable, not aspirational: nothing outside `runtime/` and `__main__.py` may
+name `chain_health.runtime`, and `bot/errors.py` no longer imports the
+transport it sits above.
+
+The `runtime/` move itself cost six import lines and left `migrations/`,
+`Dockerfile`, `alembic.ini` and `pyproject.toml` untouched. One
+operator-visible side effect: `outbox` and `watchdog` use `getLogger(__name__)`,
+so their log lines now read `chain_health.runtime.*`, and a journald filter on
+the old name stops matching. `scheduler.py` hardcodes
+`getLogger("chain_health.scheduler")` and therefore did not follow — an
+inconsistency left deliberately rather than changed inside a move-only commit.
+
+The sibling `lesson_tracker` bot now has the identical shape — five layers and
+the same four root modules — so the mental model transfers between the two
+repositories without translation.
+
+**Revisit when:** `runtime/` acquires a module that something other than
+`__main__` imports. That is the signal the rule is being bent, not that the
+rule is wrong.
+
 
 ---
 
