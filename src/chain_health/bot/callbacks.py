@@ -3,6 +3,8 @@ from enum import StrEnum
 from aiogram.filters.callback_data import CallbackData
 from pydantic import Field
 
+from chain_health.db.limits import SQLITE_INT_MAX
+
 # CallbackData packs Enum fields via `str(value.value)` (same as a plain str
 # field), so these are wire-compatible with the string literals they replace.
 
@@ -13,7 +15,6 @@ from pydantic import Field
 # "something went wrong" toast and a traceback in the journal instead of the
 # stale-button answer. Out of range now simply fails to unpack, so the filter
 # does not match and fallback.router answers properly.
-_SQLITE_INT_MAX = 2**63 - 1
 
 
 class MenuAction(StrEnum):
@@ -70,7 +71,7 @@ class GroupCB(CallbackData, prefix="group"):
     group_id: int = Field(
         default=0,
         ge=0,
-        le=_SQLITE_INT_MAX,
+        le=SQLITE_INT_MAX,
         description="Target groups.id; 0 when the action needs none",
     )
 
@@ -82,11 +83,11 @@ class ChainCB(CallbackData, prefix="chain"):
     chain_id: int = Field(
         default=0,
         ge=0,
-        le=_SQLITE_INT_MAX,
+        le=SQLITE_INT_MAX,
         description="Target chains.id; 0 when the action needs none",
     )
     group_id: int = Field(
-        default=0, ge=0, le=_SQLITE_INT_MAX, description="groups.id to return to after the action"
+        default=0, ge=0, le=SQLITE_INT_MAX, description="groups.id to return to after the action"
     )
 
 
@@ -94,9 +95,9 @@ class RotateCB(CallbackData, prefix="rotate"):
     """Callback payload for the rotation menu and its confirm step."""
 
     action: RotateAction = Field(description="Rotation step: show the menu or confirm a choice")
-    group_id: int = Field(ge=0, le=_SQLITE_INT_MAX, description="groups.id the rotation happens in")
+    group_id: int = Field(ge=0, le=SQLITE_INT_MAX, description="groups.id the rotation happens in")
     chain_id: int = Field(
-        default=0, ge=0, le=_SQLITE_INT_MAX, description="chains.id to activate; 0 on the menu step"
+        default=0, ge=0, le=SQLITE_INT_MAX, description="chains.id to activate; 0 on the menu step"
     )
 
 
@@ -104,4 +105,4 @@ class RideCB(CallbackData, prefix="ride"):
     """Callback payload for buttons under a ride in the recent-rides list."""
 
     action: RideAction = Field(description="Ride operation to perform")
-    ride_id: int = Field(ge=0, le=_SQLITE_INT_MAX, description="Target rides.id")
+    ride_id: int = Field(ge=0, le=SQLITE_INT_MAX, description="Target rides.id")
