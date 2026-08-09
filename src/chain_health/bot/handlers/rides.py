@@ -6,12 +6,9 @@ from dishka import FromDishka
 from chain_health.bot import keyboards, texts
 from chain_health.bot.callbacks import MenuAction, MenuCB, RideAction, RideCB
 from chain_health.bot.context import callback_chat_id, message_user_id
+from chain_health.bot.dialogs import ask_number_or_retry, start_edit_dialog
 from chain_health.bot.states import EditRideAmount
-from chain_health.bot.ui import (
-    Responder,
-    ask_number_or_retry,
-    start_edit_dialog,
-)
+from chain_health.bot.ui import Responder
 from chain_health.domain.constants import MAX_DISTANCE_KM
 from chain_health.services.rides import RideService
 
