@@ -107,8 +107,11 @@ def build_dispatcher(container: AsyncContainer) -> tuple[Dispatcher, asyncio.Loc
     dp.include_router(start.router)
     dp.include_router(status.router)
     dp.include_router(menu.router)
-    # groups/chains before mileage: their fsm_* handlers take bare numbers under
-    # a state, and mileage.router catches any bare number via NUMERIC_MESSAGE_RE.
+    # Split out of menu.router by subject; kept adjacent to it because they are
+    # the same menu tree. Position carries no constraint of its own — see D3:
+    # mileage.router's bare-number regex is guarded by StateFilter(None), so
+    # these fsm_* handlers win on the state filter, not on being registered
+    # earlier. Only `fallback` must hold its place.
     dp.include_router(groups.router)
     dp.include_router(chains.router)
     dp.include_router(rotation.router)
