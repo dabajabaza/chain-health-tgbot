@@ -11,8 +11,3 @@ MAX_CYCLE_LIMIT_KM = 100_000.0
 # tight enough that group_detail_text (name + limit + one line per chain)
 # can never approach Telegram's 4096-char message limit.
 MAX_NAME_LENGTH = 100
-
-# Telegram Bot API limits, not app choices — hardcoding them here (rather than
-# truncating blindly at the call site) documents *why* the cutoff is 64/200.
-TELEGRAM_INPUT_PLACEHOLDER_MAX_LEN = 64
-TELEGRAM_CALLBACK_ANSWER_MAX_LEN = 200

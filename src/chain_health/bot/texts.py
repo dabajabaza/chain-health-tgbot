@@ -1,7 +1,8 @@
 from html import escape as _esc
 
+from chain_health.bot.limits import TELEGRAM_INPUT_PLACEHOLDER_MAX_LEN
 from chain_health.db.models import Chain, Group
-from chain_health.domain.constants import MAX_NAME_LENGTH, TELEGRAM_INPUT_PLACEHOLDER_MAX_LEN
+from chain_health.domain.constants import MAX_NAME_LENGTH
 from chain_health.domain.values import ChainStatus, StatusView
 
 # Every function below is rendered with parse_mode=HTML (di.py). User-supplied

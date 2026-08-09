@@ -8,7 +8,7 @@ from aiogram.types import CallbackQuery, ErrorEvent, Message
 
 from chain_health.bot import texts
 from chain_health.bot._telegram import is_benign_edit_error
-from chain_health.domain.constants import TELEGRAM_CALLBACK_ANSWER_MAX_LEN
+from chain_health.bot.limits import TELEGRAM_CALLBACK_ANSWER_MAX_LEN
 from chain_health.domain.errors import (
     DomainError,
     InvalidOperationError,
