@@ -3,8 +3,8 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNet
 from aiogram.methods import GetMe
 
 from chain_health.bot.ui import Responder
-from tests.bot_harness import RecordingSession
-from tests.factories import (
+from tests.helpers.bot_harness import RecordingSession
+from tests.helpers.factories import (
     FAKE_BOT_TOKEN,
     make_group_with_chain,
     make_services,

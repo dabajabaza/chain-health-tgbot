@@ -1,5 +1,10 @@
 from chain_health.timeutils import local_today
-from tests.factories import make_group_with_chain, make_services, make_status_service, make_user
+from tests.helpers.factories import (
+    make_group_with_chain,
+    make_services,
+    make_status_service,
+    make_user,
+)
 
 
 async def test_status_view_flags_resource_warning(session, settings):

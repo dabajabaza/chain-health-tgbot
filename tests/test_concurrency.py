@@ -4,7 +4,7 @@ import sqlite3
 from chain_health.bot import texts as bot_texts
 from chain_health.db import engine as engine_module
 from chain_health.services.access import AccessService
-from tests.bot_harness import make_update_message
+from tests.helpers.bot_harness import make_update_message
 
 
 async def test_two_concurrent_invite_redemptions_only_one_succeeds(harness, container):

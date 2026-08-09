@@ -1,7 +1,7 @@
 from chain_health.bot import texts as bot_texts
 from chain_health.bot.callbacks import RideAction, RideCB
 from chain_health.services.rides import RideService
-from tests.factories import onboard
+from tests.helpers.factories import onboard
 
 
 async def _first_ride_id(container, user_id: int = 1) -> int:

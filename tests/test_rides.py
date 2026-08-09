@@ -4,7 +4,7 @@ import pytest
 
 from chain_health.domain.errors import NotFoundError
 from chain_health.timeutils import local_today
-from tests.factories import make_group_with_chain, make_services, make_user
+from tests.helpers.factories import make_group_with_chain, make_services, make_user
 
 
 async def test_total_km_sums_all_rides(session, settings):

@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, inspect
 
 from chain_health.db.base import Base
 from chain_health.db.models import *  # noqa: F401,F403  (register tables on Base.metadata)
-from tests.schema import apply_migrations
+from tests.helpers.schema import apply_migrations
 
 
 def test_migrated_schema_matches_the_orm_models(tmp_path):
@@ -47,7 +47,7 @@ def test_downgrade_to_base_and_back_upgrade_is_clean(tmp_path):
     from alembic import command
     from alembic.config import Config as AlembicConfig
 
-    from tests.schema import PROJECT_ROOT
+    from tests.helpers.schema import PROJECT_ROOT
 
     db_path = tmp_path / "schema.db"
     apply_migrations(f"sqlite:///{db_path}")

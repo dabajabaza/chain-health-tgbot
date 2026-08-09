@@ -8,7 +8,7 @@ from chain_health.bot.states import EditRideAmount
 from chain_health.services.access import AccessService
 from chain_health.services.garage import GarageService
 from chain_health.services.rides import RideService
-from tests.factories import fsm_state, onboard
+from tests.helpers.factories import fsm_state, onboard
 
 _FAKE_METHOD = GetMe()
 

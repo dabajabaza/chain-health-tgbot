@@ -15,8 +15,8 @@ from sqlalchemy import select
 from chain_health.db.models import ProcessedUpdate
 from chain_health.services.access import AccessService
 from chain_health.services.rides import RideService
-from tests.bot_harness import make_update_message
-from tests.factories import onboard
+from tests.helpers.bot_harness import make_update_message
+from tests.helpers.factories import onboard
 
 
 async def _rides(container, user_id: int = 1):

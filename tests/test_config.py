@@ -2,7 +2,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from tests.factories import build_settings as _settings
+from tests.helpers.factories import build_settings as _settings
 
 
 def test_admin_ids_parses_comma_list():

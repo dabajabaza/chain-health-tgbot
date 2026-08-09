@@ -24,9 +24,9 @@ from chain_health.bot.handlers import (
 from chain_health.config import Settings
 from chain_health.db.engine import create_engine
 from chain_health.di import build_container
-from tests.bot_harness import BotHarness, RecordingSession
-from tests.factories import FAKE_BOT_TOKEN
-from tests.schema import apply_migrations
+from tests.helpers.bot_harness import BotHarness, RecordingSession
+from tests.helpers.factories import FAKE_BOT_TOKEN
+from tests.helpers.schema import apply_migrations
 
 # The handler modules define their routers as module-level singletons (correct
 # for production: a real bot process builds its dispatcher exactly once). A
