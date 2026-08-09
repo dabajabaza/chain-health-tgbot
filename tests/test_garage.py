@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from chain_health.db.models import Chain
 from chain_health.domain.errors import InvalidOperationError, NotFoundError
 from chain_health.timeutils import local_today
-from tests.factories import make_group_with_chain, make_services, make_user
+from tests.helpers.factories import make_group_with_chain, make_services, make_user
 
 TODAY = date(2026, 7, 30)
 

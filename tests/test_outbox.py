@@ -21,8 +21,8 @@ from chain_health.db.models import OutboxMessage, Ride
 from chain_health.runtime import outbox
 from chain_health.services.mileage import MileageService
 from chain_health.timeutils import utcnow
-from tests.bot_harness import make_update_message
-from tests.factories import onboard
+from tests.helpers.bot_harness import make_update_message
+from tests.helpers.factories import onboard
 
 
 async def _queued(session_factory) -> list[OutboxMessage]:

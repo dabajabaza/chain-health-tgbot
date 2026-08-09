@@ -4,7 +4,7 @@ from chain_health.bot import texts as bot_texts
 from chain_health.db.models import Ride
 from chain_health.services.access import AccessService
 from chain_health.services.garage import GarageService
-from tests.factories import onboard
+from tests.helpers.factories import onboard
 
 
 async def _ride_rows(container) -> list:

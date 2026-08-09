@@ -5,7 +5,7 @@ import pytest
 from chain_health.domain.enums import RideSource
 from chain_health.domain.errors import NoActiveChainError
 from chain_health.timeutils import local_today
-from tests.factories import (
+from tests.helpers.factories import (
     make_group_with_chain,
     make_mileage_service,
     make_services,

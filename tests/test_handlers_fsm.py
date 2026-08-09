@@ -1,6 +1,6 @@
 from chain_health.bot.callbacks import GroupAction, GroupCB, MenuAction, MenuCB
 from chain_health.services.garage import GarageService
-from tests.factories import fsm_state, onboard
+from tests.helpers.factories import fsm_state, onboard
 
 
 async def test_navigating_to_menu_root_clears_a_started_dialog(harness, container):

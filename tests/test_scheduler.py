@@ -13,8 +13,8 @@ from chain_health.services.access import AccessService
 from chain_health.services.garage import GarageService
 from chain_health.services.rides import RideService
 from chain_health.timeutils import local_today
-from tests.bot_harness import RecordingSession
-from tests.factories import build_settings as _settings
+from tests.helpers.bot_harness import RecordingSession
+from tests.helpers.factories import build_settings as _settings
 
 
 def _freeze_at(monkeypatch, instant: datetime) -> None:

@@ -12,7 +12,7 @@ from chain_health.bot.callbacks import (
 from chain_health.services.access import AccessService
 from chain_health.services.garage import GarageService
 from chain_health.services.rides import RideService
-from tests.factories import onboard
+from tests.helpers.factories import onboard
 
 
 async def _first_group_and_chain(container, user_id: int = 1):

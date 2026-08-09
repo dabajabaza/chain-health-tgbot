@@ -1,4 +1,4 @@
-from tests.factories import make_user, make_user_service
+from tests.helpers.factories import make_user, make_user_service
 
 
 async def test_pinned_message_id_is_none_for_a_fresh_user(session):

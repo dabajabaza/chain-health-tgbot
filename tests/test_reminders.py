@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from chain_health.domain.values import ChainStatus
 from chain_health.timeutils import local_today
-from tests.factories import (
+from tests.helpers.factories import (
     make_group_with_chain,
     make_reminder_service,
     make_services,

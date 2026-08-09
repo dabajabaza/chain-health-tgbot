@@ -11,7 +11,7 @@ from chain_health.services.reminders import ReminderService
 from chain_health.services.rides import RideService
 from chain_health.services.status import StatusService
 from chain_health.services.users import UserService
-from tests.bot_harness import BotHarness
+from tests.helpers.bot_harness import BotHarness
 
 # Shared across every test that needs a syntactically valid but fake token —
 # one literal, so a change to the format only needs updating here.
