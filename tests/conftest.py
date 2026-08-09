@@ -9,7 +9,18 @@ from dishka import AsyncContainer
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from chain_health.__main__ import build_dispatcher
-from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
+from chain_health.bot.handlers import (
+    admin,
+    chains,
+    fallback,
+    groups,
+    menu,
+    mileage,
+    rides,
+    rotation,
+    start,
+    status,
+)
 from chain_health.config import Settings
 from chain_health.db.engine import create_engine
 from chain_health.di import build_container
@@ -27,6 +38,8 @@ _SHARED_ROUTERS = [
     start.router,
     status.router,
     menu.router,
+    groups.router,
+    chains.router,
     rotation.router,
     rides.router,
     mileage.router,

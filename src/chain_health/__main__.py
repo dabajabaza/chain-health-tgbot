@@ -12,7 +12,18 @@ from dishka.integrations.aiogram import ContainerMiddleware, setup_dishka
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from chain_health.bot.errors import on_error
-from chain_health.bot.handlers import admin, fallback, menu, mileage, rides, rotation, start, status
+from chain_health.bot.handlers import (
+    admin,
+    chains,
+    fallback,
+    groups,
+    menu,
+    mileage,
+    rides,
+    rotation,
+    start,
+    status,
+)
 from chain_health.bot.middlewares import (
     AuthMiddleware,
     IdempotencyMiddleware,
@@ -96,6 +107,10 @@ def build_dispatcher(container: AsyncContainer) -> tuple[Dispatcher, asyncio.Loc
     dp.include_router(start.router)
     dp.include_router(status.router)
     dp.include_router(menu.router)
+    # groups/chains before mileage: their fsm_* handlers take bare numbers under
+    # a state, and mileage.router catches any bare number via NUMERIC_MESSAGE_RE.
+    dp.include_router(groups.router)
+    dp.include_router(chains.router)
     dp.include_router(rotation.router)
     dp.include_router(rides.router)
     dp.include_router(mileage.router)
