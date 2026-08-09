@@ -22,9 +22,9 @@ from chain_health.bot.middlewares import (
 )
 from chain_health.config import Settings
 from chain_health.di import build_container
-from chain_health.outbox import run_sender
-from chain_health.scheduler import run_reminder_scheduler
-from chain_health.watchdog import run_watchdog, sd_notify
+from chain_health.runtime.outbox import run_sender
+from chain_health.runtime.scheduler import run_reminder_scheduler
+from chain_health.runtime.watchdog import run_watchdog, sd_notify
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 

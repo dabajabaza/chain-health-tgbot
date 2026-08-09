@@ -2,9 +2,9 @@ from datetime import datetime
 
 from aiogram import Bot
 
-import chain_health.scheduler as scheduler_module
+import chain_health.runtime.scheduler as scheduler_module
 import chain_health.timeutils as timeutils_module
-from chain_health.scheduler import (
+from chain_health.runtime.scheduler import (
     is_past_reminder_time,
     seconds_until_next_run,
     send_due_reminders,

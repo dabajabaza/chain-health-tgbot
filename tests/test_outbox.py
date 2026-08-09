@@ -15,10 +15,10 @@ from unittest.mock import patch
 
 from sqlalchemy import select
 
-from chain_health import outbox
 from chain_health.bot import texts as bot_texts
 from chain_health.bot.callbacks import MenuAction, MenuCB
 from chain_health.db.models import OutboxMessage, Ride
+from chain_health.runtime import outbox
 from chain_health.services.mileage import MileageService
 from chain_health.timeutils import utcnow
 from tests.bot_harness import make_update_message
