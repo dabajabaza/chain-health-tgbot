@@ -18,144 +18,39 @@ recorded intent consistent with the data that was committed.
 """
 
 import logging
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Literal
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State
 from aiogram.methods import (
     AnswerCallbackQuery,
     EditMessageReplyMarkup,
     EditMessageText,
     SendMessage,
-    TelegramMethod,
 )
 from aiogram.types import (
     CallbackQuery,
     InaccessibleMessage,
     InlineKeyboardMarkup,
     MaybeInaccessibleMessageUnion,
-    Message,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from chain_health.bot import keyboards, texts
-from chain_health.bot.parsing import parse_positive_float
 from chain_health.db.models import OutboxMessage
 from chain_health.domain.errors import StaleMessageError
 from chain_health.services.status import StatusService
 from chain_health.services.users import UserService
 from chain_health.timeutils import utcnow
 
-logger = logging.getLogger(__name__)
+from ._outgoing import Call, PinnedSync
+from ._telegram import dump, is_benign_edit_error, require_editable
 
-_BENIGN_EDIT_ERRORS = ("message is not modified",)
+logger = logging.getLogger(__name__)
 
 # How long an outbox row belongs to the normal send before the background
 # sender may touch it. Comfortably longer than a round trip plus a poll tick.
 OUTBOX_GRACE = timedelta(minutes=1)
-
-
-def _dump(method: TelegramMethod[Any]) -> str:
-    """An aiogram method as JSON — only the fields the caller set explicitly.
-
-    exclude_unset is required, not a size optimization: an unset field holds
-    aiogram's `Default` sentinel, which asks for a bot-level setting at send
-    time. It is not serializable, and it should not be — on revival the field
-    is unset again and picks up the default again.
-    """
-    return method.model_dump_json(exclude_unset=True)
-
-
-def is_benign_edit_error(exc: TelegramBadRequest) -> bool:
-    message = str(exc).lower()
-    return any(pattern in message for pattern in _BENIGN_EDIT_ERRORS)
-
-
-def _require_editable(message: MaybeInaccessibleMessageUnion | None) -> Message:
-    """The message behind an inline keyboard, if it can still be edited.
-
-    Checked when the intent is recorded, not when it is sent: a callback whose
-    origin message is gone or older than 48h is a bad request we can reject
-    before touching any data, and the dp.errors handler turns StaleMessageError
-    into one friendly toast instead of a traceback with a hung spinner.
-    """
-    if message is None or isinstance(message, InaccessibleMessage):
-        raise StaleMessageError("Message is no longer accessible")
-    return message
-
-
-async def start_edit_dialog(
-    callback: CallbackQuery,
-    state: FSMContext,
-    next_state: State,
-    prompt: str,
-    data: dict[str, int],
-    responder: "Responder",
-) -> None:
-    """Shared shape of every "edit this value" entry point: stash the
-    authorized entity's id in FSM state, prompt for the new value, and answer
-    the callback so its spinner stops.
-    """
-    await state.update_data(data)
-    await state.set_state(next_state)
-    responder.edit(callback.message, prompt)
-    responder.answer_callback(callback)
-
-
-def ask_number_or_retry(
-    message: Message, responder: "Responder", *, max_value: float
-) -> float | None:
-    """Parses the numeric FSM reply, or asks again and returns None.
-
-    max_value has no default and is required, on purpose: a bare
-    parse_positive_float(message.text) call once let a ride-edit/limit-edit
-    dialog accept an unbounded number, permanently corrupting cycle_km/total_km
-    or silencing over-limit warnings forever. Every caller must pick a sane
-    bound rather than being able to forget one.
-    """
-    value = parse_positive_float(message.text, max_value=max_value)
-    if value is None:
-        responder.reply_raw(message.chat.id, texts.ASK_NUMBER_RETRY)
-    return value
-
-
-# raise    — a failure is a real failure and reaches dp.errors;
-# not_modified — an edit reporting "not modified" succeeded: the user pressed
-#            the same button twice and the screen already shows what it should;
-# quiet    — cosmetic (dropping a spent keyboard); failing changes nothing.
-OnError = Literal["raise", "not_modified", "quiet"]
-
-
-@dataclass(slots=True)
-class _Call:
-    """One Bot API call, plus how much its failure matters."""
-
-    method: TelegramMethod[Any]
-    on_error: OnError = "raise"
-    # Whether this call should survive the process dying — see db.models.OutboxMessage.
-    durable: bool = False
-    # Set when the promise is written into the transaction.
-    outbox_id: int | None = None
-
-
-@dataclass(slots=True)
-class _PinnedSync:
-    """Bring the user's pinned status message up to date.
-
-    Compound on purpose: whether this edits or recreates depends on what
-    Telegram answers, so it cannot be flattened into a single method at
-    recording time. Everything it needs from the database (the text, the known
-    message id) is read while recording, inside the transaction.
-    """
-
-    chat_id: int
-    user_id: int
-    text: str
-    known_message_id: int | None
 
 
 class Responder:
@@ -170,7 +65,7 @@ class Responder:
         self._bot = bot
         self._users = users
         self._status_service = status_service
-        self._queue: list[_Call | _PinnedSync] = []
+        self._queue: list[Call | PinnedSync] = []
         self._delivered: list[int] = []
         # Filled by flush, drained by the middleware in a second short
         # transaction: a recreated pinned message only has an id once sent.
@@ -185,7 +80,7 @@ class Responder:
         view = await self._status_service.build(user_id)
         keyboard = keyboards.main_reply_keyboard(texts.placeholder_text(view))
         self._queue.append(
-            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=keyboard), durable=True)
+            Call(SendMessage(chat_id=chat_id, text=text, reply_markup=keyboard), durable=True)
         )
         if data_changed:
             await self.sync_pinned(chat_id, user_id)
@@ -203,7 +98,7 @@ class Responder:
         # Telegram allows only one keyboard type per message, so the reply-keyboard
         # placeholder is not refreshed here — it catches up on the next plain reply().
         self._queue.append(
-            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup), durable=True)
+            Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup), durable=True)
         )
         if data_changed:
             await self.sync_pinned(chat_id, user_id)
@@ -216,7 +111,7 @@ class Responder:
         """
         view = await self._status_service.build(user_id)
         self._queue.append(
-            _PinnedSync(
+            PinnedSync(
                 chat_id=chat_id,
                 user_id=user_id,
                 text=texts.pinned_status_text(view),
@@ -233,7 +128,7 @@ class Responder:
         would be pure cost — nothing about it has changed.
         """
         self._queue.append(
-            _Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup), durable=True)
+            Call(SendMessage(chat_id=chat_id, text=text, reply_markup=reply_markup), durable=True)
         )
 
     def edit(
@@ -254,9 +149,9 @@ class Responder:
         operation is applied either way and the next screen shows the truth —
         cheaper than teleporting the user into the past.
         """
-        editable = _require_editable(message)
+        editable = require_editable(message)
         self._queue.append(
-            _Call(
+            Call(
                 EditMessageText(
                     chat_id=editable.chat.id,
                     message_id=editable.message_id,
@@ -276,7 +171,7 @@ class Responder:
         if message is None or isinstance(message, InaccessibleMessage):
             return
         self._queue.append(
-            _Call(
+            Call(
                 EditMessageReplyMarkup(
                     chat_id=message.chat.id, message_id=message.message_id, reply_markup=None
                 ),
@@ -286,7 +181,7 @@ class Responder:
 
     def answer_callback(self, callback: CallbackQuery, text: str | None = None) -> None:
         """Stop the button's spinner, optionally with a toast."""
-        self._queue.append(_Call(AnswerCallbackQuery(callback_query_id=callback.id, text=text)))
+        self._queue.append(Call(AnswerCallbackQuery(callback_query_id=callback.id, text=text)))
 
     # ---------- delivery ----------
 
@@ -315,12 +210,12 @@ class Responder:
                 item,
                 OutboxMessage(
                     method=type(item.method).__name__,
-                    payload=_dump(item.method),
+                    payload=dump(item.method),
                     next_attempt_at=due,
                 ),
             )
             for item in self._queue
-            if isinstance(item, _Call) and item.durable
+            if isinstance(item, Call) and item.durable
         ]
         if not rows:
             return
@@ -352,7 +247,7 @@ class Responder:
         queued, self._queue = self._queue, []
         stale: StaleMessageError | None = None
         for item in queued:
-            if isinstance(item, _PinnedSync):
+            if isinstance(item, PinnedSync):
                 await self._sync_pinned(item)
                 continue
             try:
@@ -387,7 +282,7 @@ class Responder:
         if stale is not None:
             raise stale
 
-    async def _call(self, item: _Call) -> None:
+    async def _call(self, item: Call) -> None:
         try:
             await self._bot(item.method)
         except TelegramBadRequest as exc:
@@ -401,7 +296,7 @@ class Responder:
                 return
             raise
 
-    async def _sync_pinned(self, item: _PinnedSync) -> None:
+    async def _sync_pinned(self, item: PinnedSync) -> None:
         """Best-effort per docs/ARCHITECTURE.md D10: any Telegram-API failure
         anywhere in this sync (edit, recreate, or pin) is logged and swallowed.
         It used to matter because a raise would have rolled back a transaction
@@ -414,7 +309,7 @@ class Responder:
         except TelegramAPIError:
             logger.warning("Could not sync the pinned status message for user %s", item.user_id)
 
-    async def _do_sync_pinned(self, item: _PinnedSync) -> None:
+    async def _do_sync_pinned(self, item: PinnedSync) -> None:
         if item.known_message_id is not None:
             try:
                 await self._bot.edit_message_text(

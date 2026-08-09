@@ -8,9 +8,10 @@ from dishka import FromDishka
 from chain_health.bot import texts
 from chain_health.bot.callbacks import ChainAction, ChainCB
 from chain_health.bot.context import callback_chat_id, message_user_id
+from chain_health.bot.dialogs import ask_number_or_retry, start_edit_dialog
 from chain_health.bot.parsing import parse_positive_float
 from chain_health.bot.states import EditChainLimit, EditChainResource
-from chain_health.bot.ui import Responder, ask_number_or_retry, start_edit_dialog
+from chain_health.bot.ui import Responder
 from chain_health.domain.constants import MAX_CYCLE_LIMIT_KM
 from chain_health.services.garage import GarageService
 from chain_health.services.status import StatusService
