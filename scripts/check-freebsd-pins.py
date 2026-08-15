@@ -23,11 +23,26 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 PACKAGESITE = "https://pkg.freebsd.org/FreeBSD:15:amd64/latest/packagesite.pkg"
 PYTHON_PKG_PREFIX = "py312-"
 REQUIREMENT = re.compile(r"^([A-Za-z0-9_.-]+)==([0-9A-Za-z.]+)")
+
+
+def fetch(url: str, timeout: int, attempts: int = 3) -> bytes:
+    """GET with retries: a blip in the network must not read as a bad pin."""
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return response.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt == attempts:
+                raise RuntimeError(f"{url}: unreachable after {attempts} tries ({exc})") from exc
+            time.sleep(2 * attempt)
+    raise AssertionError("unreachable")
 
 
 def pinned(path: str) -> dict[str, str]:
@@ -38,9 +53,7 @@ def pinned(path: str) -> dict[str, str]:
 
 def has_pure_wheel(name: str, version: str) -> bool:
     """Whether PyPI ships a wheel that installs anywhere, FreeBSD included."""
-    url = f"https://pypi.org/pypi/{name}/{version}/json"
-    with urllib.request.urlopen(url, timeout=30) as response:
-        data = json.load(response)
+    data = json.loads(fetch(f"https://pypi.org/pypi/{name}/{version}/json", timeout=30))
     return any(f["filename"].endswith("-py3-none-any.whl") for f in data.get("urls", []))
 
 
@@ -54,8 +67,7 @@ def ports_versions() -> dict[str, str]:
     compares against.
     """
     with tempfile.NamedTemporaryFile(suffix=".pkg") as archive:
-        with urllib.request.urlopen(PACKAGESITE, timeout=120) as response:
-            archive.write(response.read())
+        archive.write(fetch(PACKAGESITE, timeout=120))
         archive.flush()
         index = subprocess.run(
             ["tar", "-xOf", archive.name, "packagesite.yaml"],
@@ -121,4 +133,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        # Network trouble, not a verdict on the pins — say so plainly instead of
+        # dumping a traceback that reads like the checker itself is broken.
+        print(f"check-freebsd-pins: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
